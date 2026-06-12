@@ -91,6 +91,23 @@ func TestControllerOnlyActsOnChange(t *testing.T) {
 	}
 }
 
+func TestSetTunablesAppliesNewCurve(t *testing.T) {
+	rr := &recordingRunner{temps: "Temp | 0Eh | ok | 3.1 | 40 degrees C"}
+	c := newTestController(rr)
+	if err := c.step(context.Background()); err != nil { // 40°C -> band 0 (10%)
+		t.Fatal(err)
+	}
+	before := rr.raws
+	// Reload to a curve where 40°C lands in a hotter band, then step again.
+	c.setTunables(fan.Curve{Bands: []fan.Band{{MaxTemp: 30, Percent: 25}, {MaxTemp: 80, Percent: 60}}, Hysteresis: 4}, c.sensors)
+	if err := c.step(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if rr.raws <= before {
+		t.Fatalf("expected new commands after curve reload; raws before=%d after=%d", before, rr.raws)
+	}
+}
+
 func TestControllerDryRunIssuesNoCommands(t *testing.T) {
 	rr := &recordingRunner{temps: "Temp | 0Eh | ok | 3.1 | 40 degrees C"}
 	c := newTestController(rr)

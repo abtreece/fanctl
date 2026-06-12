@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -13,8 +17,6 @@ import (
 	"github.com/abtreece/fanctl/internal/ipmi"
 )
 
-// runDaemon runs the control loop until SIGINT/SIGTERM, then restores BMC
-// automatic control. With once=true it performs a single iteration and exits.
 // newIPMIClient builds an ipmi.Client from the resolved config (in-band or
 // out-of-band depending on connection.interface).
 func newIPMIClient(cfg *config.Config) *ipmi.Client {
@@ -27,16 +29,14 @@ func newIPMIClient(cfg *config.Config) *ipmi.Client {
 	}, ipmi.ExecRunner)
 }
 
+// runDaemon runs the control loop until SIGINT/SIGTERM, then restores BMC
+// automatic control. SIGHUP and changes to the config file trigger a live
+// reload of the curve, sensors, hysteresis, and poll interval. With once=true
+// it performs a single iteration and exits.
 func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 	client := newIPMIClient(cfg)
-	ctrl := &controller{
-		log:     log,
-		client:  client,
-		curve:   cfg.FanCurve(),
-		sensors: cfg.Sensors,
-		dryRun:  dryRun,
-		level:   fan.Initial(),
-	}
+	ctrl := &controller{log: log, client: client, dryRun: dryRun}
+	ctrl.setTunables(cfg.FanCurve(), cfg.Sensors)
 
 	if once {
 		// Single shot: report what it would do and leave control as set.
@@ -50,12 +50,71 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 		"poll_interval", cfg.PollInterval,
 		"hysteresis", cfg.Hysteresis,
 		"bands", len(cfg.Curve),
+		"connection", connDesc(cfg),
 		"dry_run", dryRun,
 	)
 
 	// Always hand control back to the BMC when we exit, so a stopped daemon
 	// never leaves the fans pinned.
 	defer ctrl.handBackToAuto()
+
+	// intervalCh carries a new poll interval from a reload to the loop, which
+	// owns the ticker.
+	intervalCh := make(chan time.Duration, 1)
+	reload := func() {
+		fresh := config.Default(cfg.ConfigFile)
+		if err := config.LoadFile(cfg.ConfigFile, fresh); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			log.Warn("reload: load failed; keeping current config", "err", err)
+			return
+		}
+		if err := config.Validate(fresh); err != nil {
+			log.Warn("reload: invalid config; keeping current config", "err", err)
+			return
+		}
+		// Connection and ipmitool binary are bound into the client at startup;
+		// changing them needs a restart.
+		if fresh.IPMITool != cfg.IPMITool || fresh.Connection != cfg.Connection {
+			log.Warn("reload: connection/ipmitool changes require a restart and were not applied")
+		}
+		ctrl.setTunables(fresh.FanCurve(), fresh.Sensors)
+		if fresh.PollInterval != cfg.PollInterval {
+			select {
+			case intervalCh <- fresh.PollInterval:
+			default:
+			}
+		}
+		cfg.PollInterval = fresh.PollInterval
+		cfg.Hysteresis = fresh.Hysteresis
+		cfg.Curve = fresh.Curve
+		cfg.Sensors = fresh.Sensors
+		log.Info("config reloaded", "poll_interval", fresh.PollInterval, "hysteresis", fresh.Hysteresis, "bands", len(fresh.Curve))
+	}
+
+	// SIGHUP triggers a reload.
+	sighup := make(chan os.Signal, 1)
+	signal.Notify(sighup, syscall.SIGHUP)
+	defer signal.Stop(sighup)
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sighup:
+				log.Info("SIGHUP received; reloading config")
+				reload()
+			}
+		}
+	}()
+
+	// Watch the config file and reload on change. Watch failure is non-fatal:
+	// the daemon keeps running and SIGHUP reload still works.
+	if w, err := newConfigWatcher(cfg.ConfigFile, reload); err != nil {
+		log.Warn("config file watch disabled", "path", cfg.ConfigFile, "err", err)
+	} else {
+		go w.run(ctx)
+		defer func() { _ = w.close() }()
+		log.Info("watching config file for changes", "path", cfg.ConfigFile)
+	}
 
 	if err := ctrl.step(ctx); err != nil {
 		log.Warn("control step failed; handing to BMC automatic control", "err", err)
@@ -69,6 +128,8 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 		case <-ctx.Done():
 			log.Info("shutting down, restoring BMC automatic control")
 			return nil
+		case d := <-intervalCh:
+			ticker.Reset(d)
 		case <-ticker.C:
 			if err := ctrl.step(ctx); err != nil {
 				log.Warn("control step failed; handing to BMC automatic control", "err", err)
@@ -78,68 +139,90 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 	}
 }
 
-// controller holds the loop state: the last applied level so we only issue an
-// IPMI command when the level actually changes.
+// controller holds the loop state. Tunables (curve, sensors) are mutex-guarded
+// so a reload can swap them while the loop runs. level is the last applied fan
+// level, so we only issue an IPMI command when it changes.
 type controller struct {
-	log     *slog.Logger
-	client  *ipmi.Client
+	log    *slog.Logger
+	client *ipmi.Client
+	dryRun bool
+
+	mu      sync.Mutex
 	curve   fan.Curve
 	sensors config.SensorConfig
-	dryRun  bool
 	level   int
+}
+
+// setTunables swaps the curve and sensor selection and forces a fresh band
+// selection on the next step. Called at startup and on reload.
+func (c *controller) setTunables(curve fan.Curve, sensors config.SensorConfig) {
+	c.mu.Lock()
+	c.curve = curve
+	c.sensors = sensors
+	c.level = fan.Initial()
+	c.mu.Unlock()
 }
 
 // step reads temperatures, computes the next level, and applies it if changed.
 func (c *controller) step(ctx context.Context) error {
+	c.mu.Lock()
+	curve, sensors, prev := c.curve, c.sensors, c.level
+	c.mu.Unlock()
+
 	temps, err := c.client.Temperatures(ctx)
 	if err != nil {
 		return err
 	}
-	t, name, ok := selectMaxTemp(temps, c.sensors)
-	if !ok {
+
+	var next, pct int
+	var reason string
+	if t, name, ok := selectMaxTemp(temps, sensors); ok {
+		next = curve.Level(prev, t)
+		pct, _ = curve.Percent(next)
+		reason = fmt.Sprintf("%s=%d°C", name, t)
+	} else {
 		// No usable temperature reading: fail safe to BMC automatic control.
-		c.apply(ctx, fan.AutoLevel, 0, "no matching temperature sensors")
+		next = fan.AutoLevel
+		reason = "no matching temperature sensors"
+	}
+
+	if next == prev {
 		return nil
 	}
-	next := c.curve.Level(c.level, t)
-	pct, _ := c.curve.Percent(next)
-	c.apply(ctx, next, pct, fmt.Sprintf("%s=%d°C", name, t))
+	if err := c.applyLevel(ctx, next, pct, reason); err != nil {
+		return err
+	}
+	// Commit only if a concurrent reload hasn't reset the level meanwhile.
+	c.mu.Lock()
+	if c.level == prev {
+		c.level = next
+	}
+	c.mu.Unlock()
 	return nil
 }
 
-// apply issues the IPMI command for level, but only when it differs from the
-// last applied level. AutoLevel hands control back to the BMC.
-func (c *controller) apply(ctx context.Context, level, pct int, reason string) {
-	if level == c.level {
-		return
-	}
+// applyLevel issues the IPMI commands for a level. AutoLevel hands control back
+// to the BMC. It does no locking and performs the (slow) IPMI I/O.
+func (c *controller) applyLevel(ctx context.Context, level, pct int, reason string) error {
 	if level == fan.AutoLevel {
 		c.log.Info("fans -> BMC automatic", "reason", reason)
-		if !c.dryRun {
-			if err := c.client.SetAuto(ctx); err != nil {
-				c.log.Warn("set auto failed", "err", err)
-				return
-			}
+		if c.dryRun {
+			return nil
 		}
-		c.level = level
-		return
+		return c.client.SetAuto(ctx)
 	}
 	c.log.Info("fans -> manual", "percent", pct, "reason", reason)
-	if !c.dryRun {
-		if err := c.client.SetManual(ctx); err != nil {
-			c.log.Warn("set manual failed", "err", err)
-			return
-		}
-		if err := c.client.SetPercent(ctx, pct); err != nil {
-			c.log.Warn("set percent failed", "percent", pct, "err", err)
-			return
-		}
+	if c.dryRun {
+		return nil
 	}
-	c.level = level
+	if err := c.client.SetManual(ctx); err != nil {
+		return err
+	}
+	return c.client.SetPercent(ctx, pct)
 }
 
-// fallbackAuto forces BMC automatic control after an error, bypassing the
-// change-detection in apply so the safe state is always re-asserted.
+// fallbackAuto forces BMC automatic control after an error, bypassing
+// change-detection so the safe state is always re-asserted.
 func (c *controller) fallbackAuto(ctx context.Context) {
 	if c.dryRun {
 		return
@@ -148,7 +231,9 @@ func (c *controller) fallbackAuto(ctx context.Context) {
 		c.log.Warn("fallback set auto failed", "err", err)
 		return
 	}
+	c.mu.Lock()
 	c.level = fan.AutoLevel
+	c.mu.Unlock()
 }
 
 // handBackToAuto restores BMC control on shutdown using a fresh context, since
@@ -162,6 +247,14 @@ func (c *controller) handBackToAuto() {
 	if err := c.client.SetAuto(ctx); err != nil {
 		c.log.Warn("restore auto on shutdown failed", "err", err)
 	}
+}
+
+// connDesc is a short description of the BMC connection for logs.
+func connDesc(cfg *config.Config) string {
+	if cfg.Connection.Interface == "" || cfg.Connection.Interface == "open" {
+		return "in-band"
+	}
+	return cfg.Connection.Interface + " " + cfg.Connection.Host
 }
 
 // selectMaxTemp returns the hottest selected sensor's temperature and name.
