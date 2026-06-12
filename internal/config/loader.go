@@ -32,6 +32,9 @@ type rawFile struct {
 		Username  string `yaml:"username"`
 		Password  string `yaml:"password"`
 	} `yaml:"connection"`
+	Metrics struct {
+		Listen string `yaml:"listen"`
+	} `yaml:"metrics"`
 }
 
 // LoadFile reads a YAML config file and merges its values onto cfg (which the
@@ -88,6 +91,10 @@ func LoadFile(path string, cfg *Config) error {
 	}
 	if raw.Connection.Password != "" {
 		cfg.Connection.Password = raw.Connection.Password
+	}
+
+	if raw.Metrics.Listen != "" {
+		cfg.Metrics.Listen = raw.Metrics.Listen
 	}
 
 	return nil

@@ -95,6 +95,21 @@ set it in the unit's environment rather than committing a secret to the file.
 One fanctl process per BMC — run it wherever is convenient and point each
 instance at a different host.
 
+## Metrics
+
+Set `metrics.listen` to expose a Prometheus endpoint (hand-rendered text
+exposition — fanctl pulls in no Prometheus client dependency):
+
+```yaml
+metrics:
+  listen: ":9466"
+```
+
+`GET /metrics` reports `fanctl_temperature_celsius`, `fanctl_fan_rpm_avg`,
+`fanctl_fan_percent` (-1 when handed to BMC auto), `fanctl_bmc_auto`, and the
+`fanctl_steps_total` / `fanctl_step_errors_total` / `fanctl_reloads_total`
+counters. `GET /healthz` returns 200 while the daemon is up.
+
 ## Safety model
 
 The BMC's automatic thermal management is always the fallback. fanctl returns

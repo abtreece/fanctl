@@ -34,6 +34,11 @@ sensors:
   name_match: ["Temp"]
   name_exclude: ["Inlet", "Exhaust"]
 
+# Optional Prometheus metrics endpoint. Empty (default) disables it. When set,
+# fanctl serves /metrics and /healthz on this address (host:port).
+# metrics:
+#   listen: ":9466"
+
 # Fan curve: ascending temperature ceilings (°C) -> fan duty percent. A
 # temperature above the hottest band hands control back to the BMC's automatic
 # thermal management, which is always the safe fallback.

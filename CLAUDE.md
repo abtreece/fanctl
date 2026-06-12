@@ -88,5 +88,7 @@ hence config-driven sensor selection and curve rather than hardcoded values.
 - [x] Config file watch / SIGHUP reload — `watch.go` (fsnotify on config dir) +
   reload closure in `runDaemon`; reloads curve/sensors/hysteresis/poll interval,
   warns that connection/ipmitool changes need a restart.
-- [ ] Prometheus metrics endpoint (fan RPM, selected temp, current level).
+- [x] Prometheus metrics endpoint — `metrics.go` hand-renders the text
+  exposition (no client dep); optional `metrics.listen`. Controller keeps a
+  mutex-guarded `Snapshot`; serves /metrics + /healthz.
 - [ ] Per-zone fan control where the chassis exposes it.

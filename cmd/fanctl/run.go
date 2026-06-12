@@ -77,6 +77,7 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 			log.Warn("reload: connection/ipmitool changes require a restart and were not applied")
 		}
 		ctrl.setTunables(fresh.FanCurve(), fresh.Sensors)
+		ctrl.recordReload()
 		if fresh.PollInterval != cfg.PollInterval {
 			select {
 			case intervalCh <- fresh.PollInterval:
@@ -116,6 +117,15 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 		log.Info("watching config file for changes", "path", cfg.ConfigFile)
 	}
 
+	if cfg.Metrics.Listen != "" {
+		srv := startMetricsServer(log, cfg.Metrics.Listen, ctrl)
+		defer func() {
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(shutCtx)
+		}()
+	}
+
 	if err := ctrl.step(ctx); err != nil {
 		log.Warn("control step failed; handing to BMC automatic control", "err", err)
 		ctrl.fallbackAuto(ctx)
@@ -151,6 +161,41 @@ type controller struct {
 	curve   fan.Curve
 	sensors config.SensorConfig
 	level   int
+
+	// Observed state, for the metrics endpoint.
+	obs Snapshot
+}
+
+// Snapshot is a point-in-time view of the controller for metrics.
+type Snapshot struct {
+	HaveObs    bool
+	TempC      int
+	FanRPM     int
+	Percent    int // -1 when handed to BMC automatic control
+	BMCAuto    bool
+	Steps      uint64
+	StepErrors uint64
+	Reloads    uint64
+}
+
+// snapshot returns a copy of the current observed state.
+func (c *controller) snapshot() Snapshot {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.obs
+}
+
+func (c *controller) recordReload() {
+	c.mu.Lock()
+	c.obs.Reloads++
+	c.mu.Unlock()
+}
+
+func (c *controller) recordError() {
+	c.mu.Lock()
+	c.obs.Steps++
+	c.obs.StepErrors++
+	c.mu.Unlock()
 }
 
 // setTunables swaps the curve and sensor selection and forces a fresh band
@@ -171,31 +216,54 @@ func (c *controller) step(ctx context.Context) error {
 
 	temps, err := c.client.Temperatures(ctx)
 	if err != nil {
+		c.recordError()
 		return err
 	}
 
 	var next, pct int
 	var reason string
+	tempC, haveTemp := 0, false
 	if t, name, ok := selectMaxTemp(temps, sensors); ok {
 		next = curve.Level(prev, t)
 		pct, _ = curve.Percent(next)
 		reason = fmt.Sprintf("%s=%d°C", name, t)
+		tempC, haveTemp = t, true
 	} else {
 		// No usable temperature reading: fail safe to BMC automatic control.
 		next = fan.AutoLevel
 		reason = "no matching temperature sensors"
 	}
 
-	if next == prev {
-		return nil
+	// Best-effort fan RPM for metrics; never fails the step.
+	fanRPM := 0
+	if fans, ferr := c.client.Fans(ctx); ferr == nil {
+		fanRPM = ipmi.AverageRPM(fans)
 	}
-	if err := c.applyLevel(ctx, next, pct, reason); err != nil {
-		return err
+
+	if next != prev {
+		if err := c.applyLevel(ctx, next, pct, reason); err != nil {
+			c.recordError()
+			return err
+		}
 	}
-	// Commit only if a concurrent reload hasn't reset the level meanwhile.
+
 	c.mu.Lock()
+	// Commit the level only if a concurrent reload hasn't reset it meanwhile.
 	if c.level == prev {
 		c.level = next
+	}
+	c.obs.HaveObs = true
+	c.obs.Steps++
+	if haveTemp {
+		c.obs.TempC = tempC
+	}
+	c.obs.FanRPM = fanRPM
+	if next == fan.AutoLevel {
+		c.obs.Percent = -1
+		c.obs.BMCAuto = true
+	} else {
+		c.obs.Percent = pct
+		c.obs.BMCAuto = false
 	}
 	c.mu.Unlock()
 	return nil

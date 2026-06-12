@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"strings"
 	"time"
 
@@ -30,6 +31,14 @@ type Config struct {
 	Curve []fan.Band
 	// Connection selects in-band (default) or out-of-band BMC access.
 	Connection ConnectionConfig
+	// Metrics optionally exposes a Prometheus endpoint.
+	Metrics MetricsConfig
+}
+
+// MetricsConfig configures the optional Prometheus metrics endpoint. An empty
+// Listen disables it.
+type MetricsConfig struct {
+	Listen string // host:port, e.g. ":9466"; empty disables metrics
 }
 
 // ConnectionConfig selects how ipmitool reaches the BMC. The default empty/
@@ -129,6 +138,11 @@ func Validate(cfg *Config) error {
 		}
 	default:
 		return fmt.Errorf("connection.interface %q is not supported (use open or lanplus)", cfg.Connection.Interface)
+	}
+	if cfg.Metrics.Listen != "" {
+		if _, _, err := net.SplitHostPort(cfg.Metrics.Listen); err != nil {
+			return fmt.Errorf("metrics.listen %q is not a valid host:port: %w", cfg.Metrics.Listen, err)
+		}
 	}
 	return nil
 }
