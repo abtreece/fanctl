@@ -47,7 +47,10 @@ func writeMetrics(w io.Writer, s Snapshot) {
 	if !s.HaveObs {
 		return // no observation yet; omit value gauges
 	}
-	gauge("fanctl_temperature_celsius", "Hottest selected sensor temperature in Celsius.", s.TempC)
+	gauge("fanctl_temperature_celsius", "Hottest temperature driving the curve (CPU or GPU), in Celsius.", s.TempC)
+	if s.HaveGPU {
+		gauge("fanctl_gpu_temperature_celsius", "Hottest NVIDIA GPU temperature in Celsius.", s.GPUTempC)
+	}
 	gauge("fanctl_fan_rpm_avg", "Average fan RPM across all fans.", s.FanRPM)
 	gauge("fanctl_fan_percent", "Commanded fan duty percent; -1 when handed to BMC automatic control.", s.Percent)
 	gauge("fanctl_bmc_auto", "1 when fan control is handed back to the BMC automatic mode, else 0.", boolToInt(s.BMCAuto))

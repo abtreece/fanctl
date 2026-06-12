@@ -33,6 +33,17 @@ type Config struct {
 	Connection ConnectionConfig
 	// Metrics optionally exposes a Prometheus endpoint.
 	Metrics MetricsConfig
+	// GPU optionally factors NVIDIA GPU temperature into the curve.
+	GPU GPUConfig
+}
+
+// GPUConfig enables factoring NVIDIA GPU temperature (via nvidia-smi) into the
+// curve, for hosts with passively-cooled datacenter GPUs that depend on chassis
+// airflow. When Enabled and the GPU temperature cannot be read, the controller
+// fails safe to BMC automatic control rather than cooling on CPU data alone.
+type GPUConfig struct {
+	Enabled bool
+	Command string // nvidia-smi binary; defaults to "nvidia-smi"
 }
 
 // MetricsConfig configures the optional Prometheus metrics endpoint. An empty
@@ -107,6 +118,7 @@ func Default(path string) *Config {
 			NameExclude: []string{"Inlet", "Exhaust"},
 		},
 		Connection: ConnectionConfig{Interface: "open"},
+		GPU:        GPUConfig{Command: "nvidia-smi"},
 		Curve: []fan.Band{
 			{MaxTemp: 50, Percent: 10},
 			{MaxTemp: 60, Percent: 20},

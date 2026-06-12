@@ -8,12 +8,14 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/abtreece/fanctl/internal/config"
 	"github.com/abtreece/fanctl/internal/fan"
+	"github.com/abtreece/fanctl/internal/gpu"
 	"github.com/abtreece/fanctl/internal/ipmi"
 )
 
@@ -35,7 +37,11 @@ func newIPMIClient(cfg *config.Config) *ipmi.Client {
 // it performs a single iteration and exits.
 func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 	client := newIPMIClient(cfg)
-	ctrl := &controller{log: log, client: client, dryRun: dryRun}
+	var gpuReader *gpu.Reader
+	if cfg.GPU.Enabled {
+		gpuReader = gpu.New(cfg.GPU.Command, gpu.ExecRunner)
+	}
+	ctrl := &controller{log: log, client: client, gpu: gpuReader, dryRun: dryRun}
 	ctrl.setTunables(cfg.FanCurve(), cfg.Sensors)
 
 	if once {
@@ -155,6 +161,7 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 type controller struct {
 	log    *slog.Logger
 	client *ipmi.Client
+	gpu    *gpu.Reader // nil when GPU monitoring is disabled
 	dryRun bool
 
 	mu      sync.Mutex
@@ -169,7 +176,9 @@ type controller struct {
 // Snapshot is a point-in-time view of the controller for metrics.
 type Snapshot struct {
 	HaveObs    bool
-	TempC      int
+	TempC      int // hottest temperature driving the curve (CPU or GPU)
+	HaveGPU    bool
+	GPUTempC   int
 	FanRPM     int
 	Percent    int // -1 when handed to BMC automatic control
 	BMCAuto    bool
@@ -219,19 +228,43 @@ func (c *controller) step(ctx context.Context) error {
 		c.recordError()
 		return err
 	}
+	cpuC, cpuName, cpuOK := selectMaxTemp(temps, sensors)
+
+	// GPU temperature (optional). If GPU monitoring is enabled but the read
+	// fails, fail safe to BMC automatic control — never cool a GPU host on CPU
+	// data alone, since a passively-cooled GPU depends on chassis airflow.
+	gpuC, gpuOK, gpuFail := 0, false, false
+	if c.gpu != nil {
+		if gtemps, gerr := c.gpu.Temperatures(ctx); gerr != nil {
+			gpuFail = true
+			c.log.Warn("gpu temperature unreadable; handing to BMC automatic control", "err", gerr)
+		} else {
+			gpuC, gpuOK = gpu.Max(gtemps)
+		}
+	}
+
+	// Drive the curve off the hottest of CPU and GPU.
+	hottest, haveTemp := 0, false
+	if cpuOK {
+		hottest, haveTemp = cpuC, true
+	}
+	if gpuOK && (!haveTemp || gpuC > hottest) {
+		hottest, haveTemp = gpuC, true
+	}
 
 	var next, pct int
 	var reason string
-	tempC, haveTemp := 0, false
-	if t, name, ok := selectMaxTemp(temps, sensors); ok {
-		next = curve.Level(prev, t)
-		pct, _ = curve.Percent(next)
-		reason = fmt.Sprintf("%s=%d°C", name, t)
-		tempC, haveTemp = t, true
-	} else {
-		// No usable temperature reading: fail safe to BMC automatic control.
+	switch {
+	case gpuFail:
+		next = fan.AutoLevel
+		reason = "gpu temperature unreadable"
+	case !haveTemp:
 		next = fan.AutoLevel
 		reason = "no matching temperature sensors"
+	default:
+		next = curve.Level(prev, hottest)
+		pct, _ = curve.Percent(next)
+		reason = describeTemps(cpuName, cpuC, cpuOK, gpuC, gpuOK)
 	}
 
 	// Best-effort fan RPM for metrics; never fails the step.
@@ -255,7 +288,11 @@ func (c *controller) step(ctx context.Context) error {
 	c.obs.HaveObs = true
 	c.obs.Steps++
 	if haveTemp {
-		c.obs.TempC = tempC
+		c.obs.TempC = hottest
+	}
+	c.obs.HaveGPU = gpuOK
+	if gpuOK {
+		c.obs.GPUTempC = gpuC
 	}
 	c.obs.FanRPM = fanRPM
 	if next == fan.AutoLevel {
@@ -267,6 +304,18 @@ func (c *controller) step(ctx context.Context) error {
 	}
 	c.mu.Unlock()
 	return nil
+}
+
+// describeTemps builds a log reason like "cpu(Temp)=46°C gpu=72°C".
+func describeTemps(cpuName string, cpuC int, cpuOK bool, gpuC int, gpuOK bool) string {
+	parts := make([]string, 0, 2)
+	if cpuOK {
+		parts = append(parts, fmt.Sprintf("cpu(%s)=%d°C", cpuName, cpuC))
+	}
+	if gpuOK {
+		parts = append(parts, fmt.Sprintf("gpu=%d°C", gpuC))
+	}
+	return strings.Join(parts, " ")
 }
 
 // applyLevel issues the IPMI commands for a level. AutoLevel hands control back

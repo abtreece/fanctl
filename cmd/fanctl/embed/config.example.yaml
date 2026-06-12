@@ -39,6 +39,17 @@ sensors:
 # metrics:
 #   listen: ":9466"
 
+# Factor NVIDIA GPU temperature into the curve, for hosts with passively-cooled
+# datacenter GPUs (e.g. a Tesla T4) that rely on chassis airflow. fanctl drives
+# the curve off max(hottest CPU sensor, hottest GPU). IMPORTANT: when enabled and
+# nvidia-smi cannot be read, fanctl fails safe to BMC automatic control rather
+# than cooling on CPU data alone. On a GPU host, set the curve's top band where
+# you want the BMC to take over (the T4 throttles around 89°C), e.g. raise the
+# upper bands and hand back to auto by ~80°C.
+# gpu:
+#   enabled: true
+#   command: nvidia-smi
+
 # Fan curve: ascending temperature ceilings (°C) -> fan duty percent. A
 # temperature above the hottest band hands control back to the BMC's automatic
 # thermal management, which is always the safe fallback.

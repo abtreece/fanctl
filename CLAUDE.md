@@ -91,4 +91,17 @@ hence config-driven sensor selection and curve rather than hardcoded values.
 - [x] Prometheus metrics endpoint — `metrics.go` hand-renders the text
   exposition (no client dep); optional `metrics.listen`. Controller keeps a
   mutex-guarded `Snapshot`; serves /metrics + /healthz.
+- [x] GPU-aware cooling — `internal/gpu` reads nvidia-smi; controller drives the
+  curve off max(CPU, GPU) and FAILS SAFE to BMC-auto when GPU monitoring is
+  enabled but unreadable. `gpu.enabled`/`gpu.command` config; doctor + metrics
+  surface GPU temp. Added for an R430 with a passively-cooled Tesla T4.
 - [ ] Per-zone fan control where the chassis exposes it.
+
+## GPU hosts
+
+`internal/gpu` shells out to `nvidia-smi --query-gpu=temperature.gpu`. The
+controller takes max(hottest selected IPMI sensor, hottest GPU). Key invariant:
+GPU enabled + read failure => `fan.AutoLevel` (BMC auto), never CPU-only cooling
+— a passively-cooled GPU (T4) relies on chassis airflow, so being GPU-blind is
+unsafe. The R430 (Tesla T4) is the target host; deploy in-band there with
+`gpu.enabled: true` and a curve whose top band hands back to the BMC by ~80°C.

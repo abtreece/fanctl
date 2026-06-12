@@ -35,6 +35,10 @@ type rawFile struct {
 	Metrics struct {
 		Listen string `yaml:"listen"`
 	} `yaml:"metrics"`
+	GPU struct {
+		Enabled *bool  `yaml:"enabled"`
+		Command string `yaml:"command"`
+	} `yaml:"gpu"`
 }
 
 // LoadFile reads a YAML config file and merges its values onto cfg (which the
@@ -95,6 +99,13 @@ func LoadFile(path string, cfg *Config) error {
 
 	if raw.Metrics.Listen != "" {
 		cfg.Metrics.Listen = raw.Metrics.Listen
+	}
+
+	if raw.GPU.Enabled != nil {
+		cfg.GPU.Enabled = *raw.GPU.Enabled
+	}
+	if raw.GPU.Command != "" {
+		cfg.GPU.Command = raw.GPU.Command
 	}
 
 	return nil

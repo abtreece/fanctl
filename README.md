@@ -110,6 +110,27 @@ metrics:
 `fanctl_steps_total` / `fanctl_step_errors_total` / `fanctl_reloads_total`
 counters. `GET /healthz` returns 200 while the daemon is up.
 
+## GPU-aware cooling
+
+Hosts with a passively-cooled datacenter GPU (e.g. an NVIDIA Tesla T4) dissipate
+the GPU's heat entirely through chassis airflow — your server fans. The GPU's
+temperature is not in the BMC's IPMI sensors, so CPU-only fan control can starve
+a hot GPU of airflow. Enable GPU monitoring to factor it in:
+
+```yaml
+gpu:
+  enabled: true
+  command: nvidia-smi   # optional override
+```
+
+fanctl then drives the curve off `max(hottest CPU sensor, hottest GPU)`. Crucial
+safety property: if GPU monitoring is enabled and `nvidia-smi` cannot be read,
+fanctl **hands control back to the BMC's automatic mode** rather than cooling on
+CPU data alone. On a GPU host, set the curve's top band where you want the BMC to
+take over (a T4 throttles around 89 °C, so handing back by ~80 °C is sensible).
+With monitoring on, `fanctl doctor` reports the GPU temperature and `/metrics`
+exposes `fanctl_gpu_temperature_celsius`.
+
 ## Safety model
 
 The BMC's automatic thermal management is always the fallback. fanctl returns

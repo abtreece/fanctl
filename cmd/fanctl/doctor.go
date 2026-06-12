@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/abtreece/fanctl/internal/config"
+	"github.com/abtreece/fanctl/internal/gpu"
 	"github.com/abtreece/fanctl/internal/ipmi"
 )
 
@@ -19,6 +20,7 @@ type doctorDeps struct {
 	stat     func(string) (os.FileInfo, error)
 	lookPath func(string) (string, error)
 	newIPMI  func(*config.Config) doctorIPMI
+	newGPU   func(*config.Config) doctorGPU
 }
 
 // doctorIPMI is the BMC surface doctor exercises.
@@ -28,12 +30,20 @@ type doctorIPMI interface {
 	FirmwareRevision(context.Context) (string, error)
 }
 
+// doctorGPU is the GPU surface doctor exercises.
+type doctorGPU interface {
+	Temperatures(context.Context) ([]gpu.Temp, error)
+}
+
 func defaultDoctorDeps() doctorDeps {
 	return doctorDeps{
 		stat:     os.Stat,
 		lookPath: exec.LookPath,
 		newIPMI: func(cfg *config.Config) doctorIPMI {
 			return newIPMIClient(cfg)
+		},
+		newGPU: func(cfg *config.Config) doctorGPU {
+			return gpu.New(cfg.GPU.Command, gpu.ExecRunner)
 		},
 	}
 }
@@ -115,6 +125,20 @@ func runDoctorWithDeps(cfgPath string, stdout io.Writer, deps doctorDeps) int {
 		report.warn("fans.read", "no fan RPM readings returned")
 	} else {
 		report.ok("fans.read", "%d fans, average %d RPM", len(fans), ipmi.AverageRPM(fans))
+	}
+
+	if cfg.GPU.Enabled {
+		if _, err := deps.lookPath(cfg.GPU.Command); err != nil {
+			report.fail("gpu.tool", "%q not found in PATH (gpu monitoring is enabled)", cfg.GPU.Command)
+		} else if temps, err := deps.newGPU(cfg).Temperatures(ctx); err != nil {
+			report.fail("gpu.read", "gpu monitoring enabled but temperature read failed: %v", err)
+		} else if t, ok := gpu.Max(temps); ok {
+			report.ok("gpu.read", "%d GPU(s), hottest %d°C", len(temps), t)
+		} else {
+			report.fail("gpu.read", "gpu monitoring enabled but no GPU temperatures reported")
+		}
+	} else {
+		report.ok("gpu", "GPU monitoring disabled")
 	}
 
 	report.note("run `fanctl probe` to confirm manual fan control is honored before relying on the daemon")
