@@ -14,10 +14,15 @@ import (
 // into a Config seeded with defaults, so any field omitted from the file keeps
 // its default value.
 type rawFile struct {
-	IPMITool     string `yaml:"ipmitool"`
-	PollInterval string `yaml:"poll_interval"`
-	Hysteresis   *int   `yaml:"hysteresis"`
-	Sensors      struct {
+	IPMITool         string   `yaml:"ipmitool"`
+	PollInterval     string   `yaml:"poll_interval"`
+	PollIntervalHot  string   `yaml:"poll_interval_hot"`
+	HotDuty          *int     `yaml:"hot_duty"`
+	Hysteresis       *int     `yaml:"hysteresis"`
+	Deadband         *int     `yaml:"deadband"`
+	Lookahead        *float64 `yaml:"lookahead"`
+	ReassertInterval string   `yaml:"reassert_interval"`
+	Sensors          struct {
 		IDs         []string `yaml:"ids"`
 		NameMatch   []string `yaml:"name_match"`
 		NameExclude []string `yaml:"name_exclude"`
@@ -38,6 +43,10 @@ type rawFile struct {
 	GPU struct {
 		Enabled *bool  `yaml:"enabled"`
 		Command string `yaml:"command"`
+		Curve   []struct {
+			MaxTemp int `yaml:"max_temp"`
+			Percent int `yaml:"percent"`
+		} `yaml:"curve"`
 	} `yaml:"gpu"`
 }
 
@@ -64,8 +73,31 @@ func LoadFile(path string, cfg *Config) error {
 		}
 		cfg.PollInterval = d
 	}
+	if raw.PollIntervalHot != "" {
+		d, err := time.ParseDuration(raw.PollIntervalHot)
+		if err != nil {
+			return fmt.Errorf("poll_interval_hot: %w", err)
+		}
+		cfg.PollIntervalHot = d
+	}
+	if raw.HotDuty != nil {
+		cfg.HotDuty = *raw.HotDuty
+	}
 	if raw.Hysteresis != nil {
 		cfg.Hysteresis = *raw.Hysteresis
+	}
+	if raw.Deadband != nil {
+		cfg.Deadband = *raw.Deadband
+	}
+	if raw.Lookahead != nil {
+		cfg.Lookahead = *raw.Lookahead
+	}
+	if raw.ReassertInterval != "" {
+		d, err := time.ParseDuration(raw.ReassertInterval)
+		if err != nil {
+			return fmt.Errorf("reassert_interval: %w", err)
+		}
+		cfg.ReassertInterval = d
 	}
 	if len(raw.Sensors.IDs) > 0 {
 		cfg.Sensors.IDs = raw.Sensors.IDs
@@ -106,6 +138,13 @@ func LoadFile(path string, cfg *Config) error {
 	}
 	if raw.GPU.Command != "" {
 		cfg.GPU.Command = raw.GPU.Command
+	}
+	if len(raw.GPU.Curve) > 0 {
+		bands := make([]fan.Band, len(raw.GPU.Curve))
+		for i, b := range raw.GPU.Curve {
+			bands[i] = fan.Band{MaxTemp: b.MaxTemp, Percent: b.Percent}
+		}
+		cfg.GPU.Curve = bands
 	}
 
 	return nil

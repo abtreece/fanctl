@@ -43,6 +43,8 @@ func writeMetrics(w io.Writer, s Snapshot) {
 	counter("fanctl_steps_total", "Total control iterations performed.", s.Steps)
 	counter("fanctl_step_errors_total", "Control iterations that failed.", s.StepErrors)
 	counter("fanctl_reloads_total", "Configuration reloads applied.", s.Reloads)
+	counter("fanctl_reasserts_total", "Periodic manual-control re-asserts issued.", s.Reasserts)
+	counter("fanctl_rpm_verify_failures_total", "Duty changes whose RPM response was missing, triggering a re-assert.", s.VerifyFails)
 
 	if !s.HaveObs {
 		return // no observation yet; omit value gauges
@@ -54,6 +56,9 @@ func writeMetrics(w io.Writer, s Snapshot) {
 	gauge("fanctl_fan_rpm_avg", "Average fan RPM across all fans.", s.FanRPM)
 	gauge("fanctl_fan_percent", "Commanded fan duty percent; -1 when handed to BMC automatic control.", s.Percent)
 	gauge("fanctl_bmc_auto", "1 when fan control is handed back to the BMC automatic mode, else 0.", boolToInt(s.BMCAuto))
+	gauge("fanctl_fan_percent_computed", "Interpolated duty target before governor smoothing.", fmt.Sprintf("%.1f", s.ComputedPct))
+	gauge("fanctl_temp_slope_celsius_per_min", "Steepest temperature rise across sources, °C/min.", fmt.Sprintf("%.2f", s.SlopeCPM))
+	gauge("fanctl_hot_poll", "1 when the fast poll cadence is active, else 0.", boolToInt(s.HotPoll))
 }
 
 func boolToInt(b bool) int {

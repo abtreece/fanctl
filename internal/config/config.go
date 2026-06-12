@@ -23,8 +23,25 @@ type Config struct {
 	IPMITool string
 	// PollInterval is how often the controller re-reads temps and adjusts fans.
 	PollInterval time.Duration
-	// Hysteresis is the downward °C margin before stepping to a cooler band.
+	// PollIntervalHot, when set, is the faster poll cadence used while the
+	// system is hot or temperatures are rising. Zero disables adaptive polling.
+	PollIntervalHot time.Duration
+	// HotDuty is the commanded duty percent at or above which the hot poll
+	// cadence is used.
+	HotDuty int
+	// Hysteresis is the downward °C margin before reclaiming manual control
+	// from BMC automatic mode.
 	Hysteresis int
+	// Deadband is the minimum percent-point decrease before duty is lowered;
+	// increases always apply immediately.
+	Deadband int
+	// Lookahead is the predictive horizon in minutes: the curve is evaluated
+	// at temp + slope*lookahead so fast rises get airflow early. 0 disables.
+	Lookahead float64
+	// ReassertInterval re-issues the manual-mode commands periodically even
+	// when the duty is unchanged, recovering from an iDRAC that silently
+	// reverted to automatic control. 0 disables.
+	ReassertInterval time.Duration
 	// Sensors selects which temperature SDR records drive the curve.
 	Sensors SensorConfig
 	// Curve is the ascending temperature->percent mapping.
@@ -44,6 +61,12 @@ type Config struct {
 type GPUConfig struct {
 	Enabled bool
 	Command string // nvidia-smi binary; defaults to "nvidia-smi"
+	// Curve, when non-empty, is a GPU-specific temperature->percent mapping.
+	// The controller computes a duty per source and commands the maximum, so
+	// a passively-cooled GPU and the CPUs each get the airflow they need
+	// without one curve over-cooling for the other. Empty falls back to the
+	// shared curve.
+	Curve []fan.Band
 }
 
 // MetricsConfig configures the optional Prometheus metrics endpoint. An empty
@@ -101,18 +124,41 @@ func (s SensorConfig) Selects(id, name string) bool {
 	return false
 }
 
-// Curve assembles a fan.Curve from the config.
+// FanCurve assembles the shared (CPU) fan.Curve from the config.
 func (c *Config) FanCurve() fan.Curve {
 	return fan.Curve{Bands: c.Curve, Hysteresis: c.Hysteresis}
 }
 
+// GPUFanCurve returns the GPU-specific curve, falling back to the shared
+// curve when none is configured.
+func (c *Config) GPUFanCurve() fan.Curve {
+	if len(c.GPU.Curve) == 0 {
+		return c.FanCurve()
+	}
+	return fan.Curve{Bands: c.GPU.Curve, Hysteresis: c.Hysteresis}
+}
+
+// Governor assembles the fan.Governor from the config.
+func (c *Config) Governor() fan.Governor {
+	return fan.Governor{Deadband: c.Deadband, MaxStepDown: maxStepDown}
+}
+
+// maxStepDown caps how many percent-points the duty may fall per poll so fans
+// wind down smoothly after load drops; not currently configurable.
+const maxStepDown = 10
+
 // Default returns a Config seeded with built-in defaults for the given path.
 func Default(path string) *Config {
 	return &Config{
-		ConfigFile:   path,
-		IPMITool:     "ipmitool",
-		PollInterval: 30 * time.Second,
-		Hysteresis:   4,
+		ConfigFile:       path,
+		IPMITool:         "ipmitool",
+		PollInterval:     30 * time.Second,
+		PollIntervalHot:  0,
+		HotDuty:          50,
+		Hysteresis:       4,
+		Deadband:         3,
+		Lookahead:        1.5,
+		ReassertInterval: 5 * time.Minute,
 		Sensors: SensorConfig{
 			NameMatch:   []string{"Temp"},
 			NameExclude: []string{"Inlet", "Exhaust"},
@@ -141,6 +187,29 @@ func Validate(cfg *Config) error {
 	}
 	if err := cfg.FanCurve().Validate(); err != nil {
 		return fmt.Errorf("curve: %w", err)
+	}
+	if len(cfg.GPU.Curve) > 0 {
+		if err := cfg.GPUFanCurve().Validate(); err != nil {
+			return fmt.Errorf("gpu.curve: %w", err)
+		}
+	}
+	if cfg.PollIntervalHot != 0 && cfg.PollIntervalHot < time.Second {
+		return fmt.Errorf("poll_interval_hot must be >= 1s or 0; got %s", cfg.PollIntervalHot)
+	}
+	if cfg.PollIntervalHot > cfg.PollInterval {
+		return fmt.Errorf("poll_interval_hot (%s) must not exceed poll_interval (%s)", cfg.PollIntervalHot, cfg.PollInterval)
+	}
+	if cfg.Deadband < 0 || cfg.Deadband > 50 {
+		return fmt.Errorf("deadband %d out of range 0-50", cfg.Deadband)
+	}
+	if cfg.Lookahead < 0 || cfg.Lookahead > 10 {
+		return fmt.Errorf("lookahead %g out of range 0-10 minutes", cfg.Lookahead)
+	}
+	if cfg.HotDuty < 0 || cfg.HotDuty > 100 {
+		return fmt.Errorf("hot_duty %d out of range 0-100", cfg.HotDuty)
+	}
+	if cfg.ReassertInterval < 0 {
+		return fmt.Errorf("reassert_interval must be >= 0")
 	}
 	switch cfg.Connection.Interface {
 	case "", "open":
