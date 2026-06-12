@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
@@ -18,6 +19,18 @@ import (
 	"github.com/abtreece/fanctl/internal/gpu"
 	"github.com/abtreece/fanctl/internal/ipmi"
 )
+
+// verifyMinDelta is the commanded duty change (percent points) large enough
+// that the fans' RPM must visibly move by the next poll.
+const verifyMinDelta = 15
+
+// verifyRPMFrac is the fractional RPM change below which a large duty change
+// is judged to have had no effect (BMC ignoring manual control).
+const verifyRPMFrac = 0.03
+
+// hotSlope is the temperature rise (°C/min) at or above which the hot poll
+// cadence is used.
+const hotSlope = 1.0
 
 // newIPMIClient builds an ipmi.Client from the resolved config (in-band or
 // out-of-band depending on connection.interface).
@@ -41,8 +54,8 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 	if cfg.GPU.Enabled {
 		gpuReader = gpu.New(cfg.GPU.Command, gpu.ExecRunner)
 	}
-	ctrl := &controller{log: log, client: client, gpu: gpuReader, dryRun: dryRun}
-	ctrl.setTunables(cfg.FanCurve(), cfg.Sensors)
+	ctrl := &controller{log: log, client: client, gpu: gpuReader, dryRun: dryRun, now: time.Now}
+	ctrl.setTunables(tunablesFrom(cfg))
 
 	if once {
 		// Single shot: report what it would do and leave control as set.
@@ -54,8 +67,12 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 
 	log.Info("fanctl starting",
 		"poll_interval", cfg.PollInterval,
+		"poll_interval_hot", cfg.PollIntervalHot,
 		"hysteresis", cfg.Hysteresis,
+		"deadband", cfg.Deadband,
+		"lookahead_min", cfg.Lookahead,
 		"bands", len(cfg.Curve),
+		"gpu_bands", len(cfg.GPU.Curve),
 		"connection", connDesc(cfg),
 		"dry_run", dryRun,
 	)
@@ -64,9 +81,9 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 	// never leaves the fans pinned.
 	defer ctrl.handBackToAuto()
 
-	// intervalCh carries a new poll interval from a reload to the loop, which
-	// owns the ticker.
-	intervalCh := make(chan time.Duration, 1)
+	// intervalCh wakes the loop after a reload so it can re-evaluate the
+	// ticker cadence, which the loop owns.
+	intervalCh := make(chan struct{}, 1)
 	reload := func() {
 		fresh := config.Default(cfg.ConfigFile)
 		if err := config.LoadFile(cfg.ConfigFile, fresh); err != nil && !errors.Is(err, fs.ErrNotExist) {
@@ -82,19 +99,26 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 		if fresh.IPMITool != cfg.IPMITool || fresh.Connection != cfg.Connection {
 			log.Warn("reload: connection/ipmitool changes require a restart and were not applied")
 		}
-		ctrl.setTunables(fresh.FanCurve(), fresh.Sensors)
+		ctrl.setTunables(tunablesFrom(fresh))
 		ctrl.recordReload()
-		if fresh.PollInterval != cfg.PollInterval {
-			select {
-			case intervalCh <- fresh.PollInterval:
-			default:
-			}
+		// Keep the connection/ipmitool the client was built with so the
+		// in-memory config never disagrees with the running client.
+		fresh.IPMITool = cfg.IPMITool
+		fresh.Connection = cfg.Connection
+		*cfg = *fresh
+		select {
+		case intervalCh <- struct{}{}:
+		default:
 		}
-		cfg.PollInterval = fresh.PollInterval
-		cfg.Hysteresis = fresh.Hysteresis
-		cfg.Curve = fresh.Curve
-		cfg.Sensors = fresh.Sensors
-		log.Info("config reloaded", "poll_interval", fresh.PollInterval, "hysteresis", fresh.Hysteresis, "bands", len(fresh.Curve))
+		log.Info("config reloaded",
+			"poll_interval", fresh.PollInterval,
+			"poll_interval_hot", fresh.PollIntervalHot,
+			"hysteresis", fresh.Hysteresis,
+			"deadband", fresh.Deadband,
+			"lookahead_min", fresh.Lookahead,
+			"bands", len(fresh.Curve),
+			"gpu_bands", len(fresh.GPU.Curve),
+		)
 	}
 
 	// SIGHUP triggers a reload.
@@ -132,42 +156,93 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 		}()
 	}
 
-	if err := ctrl.step(ctx); err != nil {
-		log.Warn("control step failed; handing to BMC automatic control", "err", err)
-		ctrl.fallbackAuto(ctx)
+	step := func() {
+		if err := ctrl.step(ctx); err != nil {
+			log.Warn("control step failed; handing to BMC automatic control", "err", err)
+			ctrl.fallbackAuto(ctx)
+		}
 	}
+	step()
 
-	ticker := time.NewTicker(cfg.PollInterval)
+	current := ctrl.desiredInterval()
+	ticker := time.NewTicker(current)
 	defer ticker.Stop()
+	retick := func() {
+		if d := ctrl.desiredInterval(); d != current {
+			current = d
+			ticker.Reset(d)
+			log.Debug("poll cadence changed", "interval", d)
+		}
+	}
+	retick()
 	for {
 		select {
 		case <-ctx.Done():
 			log.Info("shutting down, restoring BMC automatic control")
 			return nil
-		case d := <-intervalCh:
-			ticker.Reset(d)
+		case <-intervalCh:
+			retick()
 		case <-ticker.C:
-			if err := ctrl.step(ctx); err != nil {
-				log.Warn("control step failed; handing to BMC automatic control", "err", err)
-				ctrl.fallbackAuto(ctx)
-			}
+			step()
+			retick()
 		}
 	}
 }
 
-// controller holds the loop state. Tunables (curve, sensors) are mutex-guarded
-// so a reload can swap them while the loop runs. level is the last applied fan
-// level, so we only issue an IPMI command when it changes.
+// tunables groups everything a reload may swap while the loop runs.
+type tunables struct {
+	curve    fan.Curve
+	gpuCurve fan.Curve
+	gov      fan.Governor
+	sensors  config.SensorConfig
+	// lookahead is the predictive horizon in minutes.
+	lookahead float64
+	// pollIdle/pollHot are the slow and fast cadences; pollHot==0 disables
+	// adaptive polling. hotDuty is the commanded duty that counts as hot.
+	pollIdle time.Duration
+	pollHot  time.Duration
+	hotDuty  int
+	// reassert re-issues manual control this long after the last IPMI write
+	// even when the duty is unchanged. 0 disables.
+	reassert time.Duration
+}
+
+func tunablesFrom(cfg *config.Config) tunables {
+	return tunables{
+		curve:     cfg.FanCurve(),
+		gpuCurve:  cfg.GPUFanCurve(),
+		gov:       cfg.Governor(),
+		sensors:   cfg.Sensors,
+		lookahead: cfg.Lookahead,
+		pollIdle:  cfg.PollInterval,
+		pollHot:   cfg.PollIntervalHot,
+		hotDuty:   cfg.HotDuty,
+		reassert:  cfg.ReassertInterval,
+	}
+}
+
+// controller holds the loop state. Tunables are mutex-guarded so a reload can
+// swap them while the loop runs. state is the last commanded fan state; an
+// IPMI command is issued on state change, on the periodic re-assert, or when
+// RPM verification shows a command had no effect.
 type controller struct {
 	log    *slog.Logger
 	client *ipmi.Client
 	gpu    *gpu.Reader // nil when GPU monitoring is disabled
 	dryRun bool
+	now    func() time.Time
 
-	mu      sync.Mutex
-	curve   fan.Curve
-	sensors config.SensorConfig
-	level   int
+	mu        sync.Mutex
+	tun       tunables
+	state     fan.State
+	cpuPred   fan.Predictor
+	gpuPred   fan.Predictor
+	lastApply time.Time
+	// verification of the previous apply: expectPct is the commanded duty and
+	// baseRPM the average RPM observed when it was issued.
+	verifyPending bool
+	verifyDelta   int
+	baseRPM       int
 
 	// Observed state, for the metrics endpoint.
 	obs Snapshot
@@ -175,16 +250,21 @@ type controller struct {
 
 // Snapshot is a point-in-time view of the controller for metrics.
 type Snapshot struct {
-	HaveObs    bool
-	TempC      int // hottest temperature driving the curve (CPU or GPU)
-	HaveGPU    bool
-	GPUTempC   int
-	FanRPM     int
-	Percent    int // -1 when handed to BMC automatic control
-	BMCAuto    bool
-	Steps      uint64
-	StepErrors uint64
-	Reloads    uint64
+	HaveObs     bool
+	TempC       int // hottest temperature driving the curve (CPU or GPU)
+	HaveGPU     bool
+	GPUTempC    int
+	SlopeCPM    float64 // steepest temperature slope across sources, °C/min
+	ComputedPct float64 // interpolated duty target before governor smoothing
+	FanRPM      int
+	Percent     int // -1 when handed to BMC automatic control
+	BMCAuto     bool
+	HotPoll     bool
+	Steps       uint64
+	StepErrors  uint64
+	Reloads     uint64
+	Reasserts   uint64
+	VerifyFails uint64
 }
 
 // snapshot returns a copy of the current observed state.
@@ -207,28 +287,47 @@ func (c *controller) recordError() {
 	c.mu.Unlock()
 }
 
-// setTunables swaps the curve and sensor selection and forces a fresh band
-// selection on the next step. Called at startup and on reload.
-func (c *controller) setTunables(curve fan.Curve, sensors config.SensorConfig) {
+// setTunables swaps the tunables and forces a fresh decision on the next
+// step. Called at startup and on reload.
+func (c *controller) setTunables(t tunables) {
 	c.mu.Lock()
-	c.curve = curve
-	c.sensors = sensors
-	c.level = fan.Initial()
+	c.tun = t
+	c.state = fan.State{}
+	c.cpuPred.Reset()
+	c.gpuPred.Reset()
+	c.verifyPending = false
 	c.mu.Unlock()
 }
 
-// step reads temperatures, computes the next level, and applies it if changed.
+// desiredInterval picks the poll cadence from the last observation: the hot
+// cadence while duty is high or temperature is rising, otherwise the idle one.
+func (c *controller) desiredInterval() time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	t := c.tun
+	if t.pollHot == 0 {
+		return t.pollIdle
+	}
+	if c.obs.HaveObs && (c.obs.HotPoll) {
+		return t.pollHot
+	}
+	return t.pollIdle
+}
+
+// step reads temperatures, computes the next state, and applies it when the
+// state changes, the re-assert interval has elapsed, or verification failed.
 func (c *controller) step(ctx context.Context) error {
 	c.mu.Lock()
-	curve, sensors, prev := c.curve, c.sensors, c.level
+	tun, prev := c.tun, c.state
 	c.mu.Unlock()
+	now := c.now()
 
 	temps, err := c.client.Temperatures(ctx)
 	if err != nil {
 		c.recordError()
 		return err
 	}
-	cpuC, cpuName, cpuOK := selectMaxTemp(temps, sensors)
+	cpuC, cpuName, cpuOK := selectMaxTemp(temps, tun.sensors)
 
 	// GPU temperature (optional). If GPU monitoring is enabled but the read
 	// fails, fail safe to BMC automatic control — never cool a GPU host on CPU
@@ -243,7 +342,24 @@ func (c *controller) step(ctx context.Context) error {
 		}
 	}
 
-	// Drive the curve off the hottest of CPU and GPU.
+	// Per-source predictive boost: evaluate each curve at where its source is
+	// heading, then command the maximum of the per-source duties.
+	c.mu.Lock()
+	var cpuEff, gpuEff, slope float64
+	if cpuOK {
+		c.cpuPred.Observe(now, float64(cpuC))
+		cpuEff = float64(cpuC) + c.cpuPred.Boost(tun.lookahead)
+		slope = c.cpuPred.SlopePerMin()
+	}
+	if gpuOK {
+		c.gpuPred.Observe(now, float64(gpuC))
+		gpuEff = float64(gpuC) + c.gpuPred.Boost(tun.lookahead)
+		if s := c.gpuPred.SlopePerMin(); s > slope {
+			slope = s
+		}
+	}
+	c.mu.Unlock()
+
 	hottest, haveTemp := 0, false
 	if cpuOK {
 		hottest, haveTemp = cpuC, true
@@ -252,38 +368,91 @@ func (c *controller) step(ctx context.Context) error {
 		hottest, haveTemp = gpuC, true
 	}
 
-	var next, pct int
+	var next fan.State
+	var target float64
 	var reason string
 	switch {
 	case gpuFail:
-		next = fan.AutoLevel
+		next = fan.State{Auto: true, Init: true}
 		reason = "gpu temperature unreadable"
 	case !haveTemp:
-		next = fan.AutoLevel
+		next = fan.State{Auto: true, Init: true}
 		reason = "no matching temperature sensors"
 	default:
-		next = curve.Level(prev, hottest)
-		pct, _ = curve.Percent(next)
+		wantAuto, canReclaim := false, true
+		if cpuOK {
+			d, a := tun.curve.Duty(cpuEff)
+			target, wantAuto = math.Max(target, d), wantAuto || a
+			canReclaim = canReclaim && float64(cpuC) <= tun.curve.ReclaimBelow()
+		}
+		if gpuOK {
+			d, a := tun.gpuCurve.Duty(gpuEff)
+			target, wantAuto = math.Max(target, d), wantAuto || a
+			canReclaim = canReclaim && float64(gpuC) <= tun.gpuCurve.ReclaimBelow()
+		}
+		next = tun.gov.Next(prev, target, wantAuto, canReclaim)
 		reason = describeTemps(cpuName, cpuC, cpuOK, gpuC, gpuOK)
+		if slope >= 0.5 {
+			reason += fmt.Sprintf(" rising=%.1f°C/min", slope)
+		}
 	}
 
-	// Best-effort fan RPM for metrics; never fails the step.
+	// Best-effort fan RPM for metrics and verification; never fails the step.
 	fanRPM := 0
 	if fans, ferr := c.client.Fans(ctx); ferr == nil {
 		fanRPM = ipmi.AverageRPM(fans)
 	}
 
-	if next != prev {
-		if err := c.applyLevel(ctx, next, pct, reason); err != nil {
+	// Verify the previous apply took effect: a large duty change must move the
+	// observed RPM. A flat response means the BMC is ignoring manual control
+	// (e.g. iDRAC reset back to automatic) — re-assert and count it.
+	c.mu.Lock()
+	verifyFailed, failedDelta := false, 0
+	if c.verifyPending {
+		// An over-temp handoff to BMC-auto invalidates the expectation (the
+		// BMC ramps the fans itself); just drop the pending check.
+		if !next.Auto && fanRPM > 0 && c.baseRPM > 0 &&
+			math.Abs(float64(fanRPM-c.baseRPM)) < verifyRPMFrac*float64(c.baseRPM) {
+			verifyFailed, failedDelta = true, c.verifyDelta
+			c.obs.VerifyFails++
+		}
+		c.verifyPending = false
+	}
+	reassertDue := tun.reassert > 0 && !prev.Auto && prev.Init && now.Sub(c.lastApply) >= tun.reassert
+	c.mu.Unlock()
+	if verifyFailed {
+		c.log.Warn("fan duty change had no RPM effect; re-asserting manual control",
+			"commanded_delta_pct", failedDelta, "rpm", fanRPM)
+	}
+
+	changed := next != prev
+	if changed || reassertDue || verifyFailed {
+		if reassertDue && !changed && !verifyFailed {
+			c.log.Debug("re-asserting manual fan control", "percent", next.Pct)
+		}
+		if err := c.applyState(ctx, next, reason); err != nil {
 			c.recordError()
 			return err
 		}
+		c.mu.Lock()
+		c.lastApply = now
+		if reassertDue && !changed {
+			c.obs.Reasserts++
+		}
+		// Arm verification when a manual duty change is big enough that the
+		// RPM must respond by the next poll.
+		if changed && !next.Auto && prev.Init && !prev.Auto && fanRPM > 0 {
+			if d := next.Pct - prev.Pct; d >= verifyMinDelta || d <= -verifyMinDelta {
+				c.verifyPending, c.verifyDelta, c.baseRPM = true, d, fanRPM
+			}
+		}
+		c.mu.Unlock()
 	}
 
 	c.mu.Lock()
-	// Commit the level only if a concurrent reload hasn't reset it meanwhile.
-	if c.level == prev {
-		c.level = next
+	// Commit the state only if a concurrent reload hasn't reset it meanwhile.
+	if c.state == prev {
+		c.state = next
 	}
 	c.obs.HaveObs = true
 	c.obs.Steps++
@@ -294,14 +463,17 @@ func (c *controller) step(ctx context.Context) error {
 	if gpuOK {
 		c.obs.GPUTempC = gpuC
 	}
+	c.obs.SlopeCPM = slope
+	c.obs.ComputedPct = target
 	c.obs.FanRPM = fanRPM
-	if next == fan.AutoLevel {
+	if next.Auto {
 		c.obs.Percent = -1
 		c.obs.BMCAuto = true
 	} else {
-		c.obs.Percent = pct
+		c.obs.Percent = next.Pct
 		c.obs.BMCAuto = false
 	}
+	c.obs.HotPoll = next.Auto || next.Pct >= tun.hotDuty || slope >= hotSlope
 	c.mu.Unlock()
 	return nil
 }
@@ -318,24 +490,24 @@ func describeTemps(cpuName string, cpuC int, cpuOK bool, gpuC int, gpuOK bool) s
 	return strings.Join(parts, " ")
 }
 
-// applyLevel issues the IPMI commands for a level. AutoLevel hands control back
-// to the BMC. It does no locking and performs the (slow) IPMI I/O.
-func (c *controller) applyLevel(ctx context.Context, level, pct int, reason string) error {
-	if level == fan.AutoLevel {
+// applyState issues the IPMI commands for a state. Auto hands control back to
+// the BMC. It does no locking and performs the (slow) IPMI I/O.
+func (c *controller) applyState(ctx context.Context, s fan.State, reason string) error {
+	if s.Auto {
 		c.log.Info("fans -> BMC automatic", "reason", reason)
 		if c.dryRun {
 			return nil
 		}
 		return c.client.SetAuto(ctx)
 	}
-	c.log.Info("fans -> manual", "percent", pct, "reason", reason)
+	c.log.Info("fans -> manual", "percent", s.Pct, "reason", reason)
 	if c.dryRun {
 		return nil
 	}
 	if err := c.client.SetManual(ctx); err != nil {
 		return err
 	}
-	return c.client.SetPercent(ctx, pct)
+	return c.client.SetPercent(ctx, s.Pct)
 }
 
 // fallbackAuto forces BMC automatic control after an error, bypassing
@@ -349,7 +521,8 @@ func (c *controller) fallbackAuto(ctx context.Context) {
 		return
 	}
 	c.mu.Lock()
-	c.level = fan.AutoLevel
+	c.state = fan.State{Auto: true, Init: true}
+	c.verifyPending = false
 	c.mu.Unlock()
 }
 

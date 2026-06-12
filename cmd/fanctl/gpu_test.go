@@ -6,9 +6,8 @@ import (
 	"io"
 	"log/slog"
 	"testing"
+	"time"
 
-	"github.com/abtreece/fanctl/internal/config"
-	"github.com/abtreece/fanctl/internal/fan"
 	"github.com/abtreece/fanctl/internal/gpu"
 	"github.com/abtreece/fanctl/internal/ipmi"
 )
@@ -32,15 +31,14 @@ func (r *gpuRunner) nvidia(_ context.Context, _ string, _ ...string) ([]byte, er
 }
 
 func newGPUController(rr *gpuRunner) *controller {
+	clock := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	c := &controller{
 		log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
 		client: ipmi.New(ipmi.Options{Bin: "ipmitool"}, rr.ipmi),
 		gpu:    gpu.New("nvidia-smi", rr.nvidia),
+		now:    func() time.Time { return clock },
 	}
-	c.setTunables(
-		fan.Curve{Bands: []fan.Band{{MaxTemp: 50, Percent: 10}, {MaxTemp: 60, Percent: 20}, {MaxTemp: 68, Percent: 30}, {MaxTemp: 75, Percent: 45}}, Hysteresis: 4},
-		config.SensorConfig{NameMatch: []string{"Temp"}, NameExclude: []string{"Inlet"}},
-	)
+	c.setTunables(testTunables())
 	return c
 }
 
@@ -51,9 +49,9 @@ func TestGPUDrivesCurveWhenHotter(t *testing.T) {
 	if err := c.step(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	// 40°C CPU alone -> band 0 (10%); GPU 72°C -> band 3 (45%).
-	if s := c.snapshot(); s.Percent != 45 {
-		t.Fatalf("commanded %d%%, want 45%% (GPU at 72°C should drive the curve)", s.Percent)
+	// 40°C CPU alone -> 10%; GPU 72°C interpolates 68..75 -> ~39%.
+	if s := c.snapshot(); s.Percent != 39 {
+		t.Fatalf("commanded %d%%, want 39%% (GPU at 72°C should drive the curve)", s.Percent)
 	}
 }
 

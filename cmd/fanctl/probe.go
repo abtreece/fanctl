@@ -66,56 +66,56 @@ func probe(stdout, stderr io.Writer, client fanController, opt probeOptions) int
 
 	before, err := client.Fans(ctx)
 	if err != nil {
-		fmt.Fprintf(stderr, "probe: read fans: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "probe: read fans: %v\n", err)
 		return 1
 	}
 	baseline := ipmi.AverageRPM(before)
-	fmt.Fprintf(stdout, "baseline:   %d RPM across %d fans\n", baseline, len(before))
+	_, _ = fmt.Fprintf(stdout, "baseline:   %d RPM across %d fans\n", baseline, len(before))
 	if baseline == 0 {
-		fmt.Fprintln(stderr, "probe: no fan RPM readings; cannot probe")
+		_, _ = fmt.Fprintln(stderr, "probe: no fan RPM readings; cannot probe")
 		return 1
 	}
 
-	fmt.Fprintf(stdout, "commanding: manual control at %d%%\n", opt.low)
+	_, _ = fmt.Fprintf(stdout, "commanding: manual control at %d%%\n", opt.low)
 	if err := client.SetManual(ctx); err != nil {
-		fmt.Fprintf(stderr, "probe: set manual: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "probe: set manual: %v\n", err)
 		return 1
 	}
 	if err := client.SetPercent(ctx, opt.low); err != nil {
-		fmt.Fprintf(stderr, "probe: set percent: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "probe: set percent: %v\n", err)
 		return 1
 	}
 
-	fmt.Fprintf(stdout, "waiting:    %s for fans to settle...\n", opt.settle)
+	_, _ = fmt.Fprintf(stdout, "waiting:    %s for fans to settle...\n", opt.settle)
 	sleep(ctx, opt.settle)
 
 	after, err := client.Fans(ctx)
 	if err != nil {
-		fmt.Fprintf(stderr, "probe: re-read fans: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "probe: re-read fans: %v\n", err)
 		return 1
 	}
 	low := ipmi.AverageRPM(after)
-	fmt.Fprintf(stdout, "at %d%%:     %d RPM\n", opt.low, low)
+	_, _ = fmt.Fprintf(stdout, "at %d%%:     %d RPM\n", opt.low, low)
 
 	if opt.restore {
 		if err := client.SetAuto(ctx); err != nil {
-			fmt.Fprintf(stderr, "probe: restore auto: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "probe: restore auto: %v\n", err)
 		} else {
-			fmt.Fprintln(stdout, "restored:   BMC automatic control")
+			_, _ = fmt.Fprintln(stdout, "restored:   BMC automatic control")
 		}
 	}
 
 	drop := baseline - low
 	dropPct := drop * 100 / baseline
-	fmt.Fprintf(stdout, "\nRPM dropped %d (%d%%) when commanded to %d%%.\n", drop, dropPct, opt.low)
+	_, _ = fmt.Fprintf(stdout, "\nRPM dropped %d (%d%%) when commanded to %d%%.\n", drop, dropPct, opt.low)
 	if dropPct >= opt.minDropPct {
-		fmt.Fprintln(stdout, "RESULT: manual fan control WORKS on this host.")
+		_, _ = fmt.Fprintln(stdout, "RESULT: manual fan control WORKS on this host.")
 		return 0
 	}
-	fmt.Fprintln(stdout, "RESULT: manual fan control appears to be IGNORED.")
-	fmt.Fprintln(stdout, "  The BMC accepted the commands but RPM did not drop. Likely causes:")
-	fmt.Fprintln(stdout, "  - iDRAC firmware that disables raw fan control (Dell did this in some builds), or")
-	fmt.Fprintln(stdout, "  - the forced baseline already sits near the commanded duty (try a lower --percent).")
+	_, _ = fmt.Fprintln(stdout, "RESULT: manual fan control appears to be IGNORED.")
+	_, _ = fmt.Fprintln(stdout, "  The BMC accepted the commands but RPM did not drop. Likely causes:")
+	_, _ = fmt.Fprintln(stdout, "  - iDRAC firmware that disables raw fan control (Dell did this in some builds), or")
+	_, _ = fmt.Fprintln(stdout, "  - the forced baseline already sits near the commanded duty (try a lower --percent).")
 	return 1
 }
 
@@ -134,7 +134,7 @@ func sleep(ctx context.Context, d time.Duration) {
 func loadConfigOrDefault(path string) *config.Config {
 	cfg := config.Default(path)
 	if err := config.LoadFile(path, cfg); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		fmt.Fprintf(os.Stderr, "warning: %v; using defaults\n", err)
+		_, _ = fmt.Fprintf(os.Stderr, "warning: %v; using defaults\n", err)
 	}
 	return cfg
 }

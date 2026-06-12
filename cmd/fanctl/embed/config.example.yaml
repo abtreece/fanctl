@@ -19,10 +19,31 @@ ipmitool: ipmitool
 # How often to re-read temperatures and adjust fans.
 poll_interval: 30s
 
-# Downward hysteresis in °C: the controller only steps to a cooler/quieter band
-# once the temperature has fallen this far below the lower band's ceiling. Stops
-# the fans hunting at a boundary.
+# Optional faster cadence used while the system is hot (commanded duty >=
+# hot_duty) or temperature is rising >= 1°C/min. 0 (default) disables adaptive
+# polling and poll_interval is used throughout.
+# poll_interval_hot: 5s
+# hot_duty: 50
+
+# Hysteresis in °C: after handing control to the BMC on over-temp, manual
+# control is only reclaimed once the temperature has fallen this far below the
+# curve's top anchor, which stops flapping at the handoff boundary.
 hysteresis: 4
+
+# Deadband in percent points: small downward duty wobble is held to avoid
+# hunting and IPMI churn. Increases always apply immediately.
+deadband: 3
+
+# Predictive lookahead in minutes: the curve is evaluated at
+# temp + slope * lookahead, so a fast temperature rise gets airflow early
+# instead of the fans chasing it. The boost is capped at 8°C and never
+# negative. 0 disables prediction.
+lookahead: 1.5
+
+# Re-issue the manual-control commands this often even when the duty is
+# unchanged, recovering from an iDRAC that silently reverted to automatic
+# control (e.g. after a BMC reset). 0 disables.
+reassert_interval: 5m
 
 # Which temperature sensors drive the curve. If `ids` is set it wins; otherwise
 # a sensor is selected when its name contains any `name_match` substring and
@@ -39,20 +60,31 @@ sensors:
 # metrics:
 #   listen: ":9466"
 
-# Factor NVIDIA GPU temperature into the curve, for hosts with passively-cooled
-# datacenter GPUs (e.g. a Tesla T4) that rely on chassis airflow. fanctl drives
-# the curve off max(hottest CPU sensor, hottest GPU). IMPORTANT: when enabled and
-# nvidia-smi cannot be read, fanctl fails safe to BMC automatic control rather
-# than cooling on CPU data alone. On a GPU host, set the curve's top band where
-# you want the BMC to take over (the T4 throttles around 89°C), e.g. raise the
-# upper bands and hand back to auto by ~80°C.
+# Factor NVIDIA GPU temperature into the control loop, for hosts with
+# passively-cooled datacenter GPUs (e.g. a Tesla T4) that rely on chassis
+# airflow. With a gpu.curve, fanctl computes a duty per source (CPU curve vs
+# GPU curve) and commands the maximum, so each device gets the airflow it
+# needs; without one the GPU shares the main curve. IMPORTANT: when enabled
+# and nvidia-smi cannot be read, fanctl fails safe to BMC automatic control
+# rather than cooling on CPU data alone. Keep the GPU curve's top anchor just
+# under the card's throttle point (the T4 throttles around 89°C).
 # gpu:
 #   enabled: true
 #   command: nvidia-smi
+#   curve:
+#     - max_temp: 55
+#       percent: 20
+#     - max_temp: 70
+#       percent: 50
+#     - max_temp: 78
+#       percent: 70
+#     - max_temp: 85
+#       percent: 100
 
-# Fan curve: ascending temperature ceilings (°C) -> fan duty percent. A
-# temperature above the hottest band hands control back to the BMC's automatic
-# thermal management, which is always the safe fallback.
+# Fan curve: ascending temperature anchors (°C) -> fan duty percent. Duty is
+# linearly interpolated between anchors. A temperature above the hottest
+# anchor hands control back to the BMC's automatic thermal management, which
+# is always the safe fallback.
 curve:
   - max_temp: 50
     percent: 10
