@@ -33,10 +33,10 @@ func startMetricsServer(log *slog.Logger, addr string, c *controller) *http.Serv
 // writeMetrics renders the controller snapshot as Prometheus text exposition.
 func writeMetrics(w io.Writer, s Snapshot) {
 	gauge := func(name, help string, val any) {
-		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %v\n", name, help, name, name, val)
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %v\n", name, help, name, name, val)
 	}
 	counter := func(name, help string, val uint64) {
-		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", name, help, name, name, val)
+		_, _ = fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", name, help, name, name, val)
 	}
 
 	gauge("fanctl_up", "fanctl controller is running.", 1)

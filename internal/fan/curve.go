@@ -42,6 +42,9 @@ func (c Curve) Validate() error {
 	if c.Hysteresis < 0 {
 		return fmt.Errorf("hysteresis must be >= 0")
 	}
+	if top := c.Bands[len(c.Bands)-1].MaxTemp; c.Hysteresis >= top {
+		return fmt.Errorf("hysteresis %d must be less than the top anchor's max_temp %d, or manual control could never be reclaimed from BMC automatic mode", c.Hysteresis, top)
+	}
 	return nil
 }
 

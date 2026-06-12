@@ -153,21 +153,21 @@ type doctorReport struct {
 }
 
 func (r *doctorReport) ok(name, format string, args ...any) {
-	fmt.Fprintf(r.w, "ok    %-16s %s\n", name, fmt.Sprintf(format, args...))
+	_, _ = fmt.Fprintf(r.w, "ok    %-16s %s\n", name, fmt.Sprintf(format, args...))
 }
 
 func (r *doctorReport) warn(name, format string, args ...any) {
 	r.warnings++
-	fmt.Fprintf(r.w, "warn  %-16s %s\n", name, fmt.Sprintf(format, args...))
+	_, _ = fmt.Fprintf(r.w, "warn  %-16s %s\n", name, fmt.Sprintf(format, args...))
 }
 
 func (r *doctorReport) fail(name, format string, args ...any) {
 	r.failures++
-	fmt.Fprintf(r.w, "FAIL  %-16s %s\n", name, fmt.Sprintf(format, args...))
+	_, _ = fmt.Fprintf(r.w, "FAIL  %-16s %s\n", name, fmt.Sprintf(format, args...))
 }
 
 func (r *doctorReport) note(msg string) {
-	fmt.Fprintf(r.w, "\nnote: %s\n", msg)
+	_, _ = fmt.Fprintf(r.w, "\nnote: %s\n", msg)
 }
 
 func (r *doctorReport) exitCode() int {

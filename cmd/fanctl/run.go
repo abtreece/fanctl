@@ -101,6 +101,10 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 		}
 		ctrl.setTunables(tunablesFrom(fresh))
 		ctrl.recordReload()
+		// Keep the connection/ipmitool the client was built with so the
+		// in-memory config never disagrees with the running client.
+		fresh.IPMITool = cfg.IPMITool
+		fresh.Connection = cfg.Connection
 		*cfg = *fresh
 		select {
 		case intervalCh <- struct{}{}:
@@ -404,8 +408,11 @@ func (c *controller) step(ctx context.Context) error {
 	// (e.g. iDRAC reset back to automatic) — re-assert and count it.
 	c.mu.Lock()
 	verifyFailed, failedDelta := false, 0
-	if c.verifyPending && fanRPM > 0 && c.baseRPM > 0 {
-		if math.Abs(float64(fanRPM-c.baseRPM)) < verifyRPMFrac*float64(c.baseRPM) {
+	if c.verifyPending {
+		// An over-temp handoff to BMC-auto invalidates the expectation (the
+		// BMC ramps the fans itself); just drop the pending check.
+		if !next.Auto && fanRPM > 0 && c.baseRPM > 0 &&
+			math.Abs(float64(fanRPM-c.baseRPM)) < verifyRPMFrac*float64(c.baseRPM) {
 			verifyFailed, failedDelta = true, c.verifyDelta
 			c.obs.VerifyFails++
 		}
