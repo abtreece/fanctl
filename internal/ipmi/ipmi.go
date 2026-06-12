@@ -20,22 +20,59 @@ func ExecRunner(ctx context.Context, name string, args ...string) ([]byte, error
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
-// Client talks to the BMC through ipmitool.
-type Client struct {
-	bin string
-	run Runner
+// Options configures how the Client reaches the BMC.
+type Options struct {
+	Bin string // ipmitool binary; defaults to "ipmitool"
+	// Interface selects the ipmitool interface. Empty or "open" means in-band
+	// (local /dev/ipmi0). "lanplus" means out-of-band over the network, in
+	// which case Host (and usually Username/Password) are required.
+	Interface string
+	Host      string
+	Username  string
+	Password  string
 }
 
-// New returns a Client. bin defaults to "ipmitool" when empty; run defaults to
-// ExecRunner when nil.
-func New(bin string, run Runner) *Client {
+// Client talks to the BMC through ipmitool.
+type Client struct {
+	bin      string
+	connArgs []string
+	run      Runner
+}
+
+// New returns a Client for the given options. run defaults to ExecRunner.
+func New(opt Options, run Runner) *Client {
+	bin := opt.Bin
 	if bin == "" {
 		bin = "ipmitool"
 	}
 	if run == nil {
 		run = ExecRunner
 	}
-	return &Client{bin: bin, run: run}
+	var conn []string
+	switch opt.Interface {
+	case "", "open":
+		// In-band: no connection arguments.
+	default:
+		conn = append(conn, "-I", opt.Interface)
+		if opt.Host != "" {
+			conn = append(conn, "-H", opt.Host)
+		}
+		if opt.Username != "" {
+			conn = append(conn, "-U", opt.Username)
+		}
+		if opt.Password != "" {
+			conn = append(conn, "-P", opt.Password)
+		}
+	}
+	return &Client{bin: bin, connArgs: conn, run: run}
+}
+
+// exec runs ipmitool with the connection arguments prepended.
+func (c *Client) exec(ctx context.Context, args ...string) ([]byte, error) {
+	full := make([]string, 0, len(c.connArgs)+len(args))
+	full = append(full, c.connArgs...)
+	full = append(full, args...)
+	return c.run(ctx, c.bin, full...)
 }
 
 // Temp is a parsed temperature SDR record.
@@ -114,7 +151,7 @@ func (c *Client) SetPercent(ctx context.Context, pct int) error {
 
 // FirmwareRevision returns the BMC firmware revision string from `mc info`.
 func (c *Client) FirmwareRevision(ctx context.Context) (string, error) {
-	out, err := c.run(ctx, c.bin, "mc", "info")
+	out, err := c.exec(ctx, "mc", "info")
 	if err != nil {
 		return "", fmt.Errorf("ipmitool mc info: %w", err)
 	}
@@ -129,7 +166,7 @@ func (c *Client) FirmwareRevision(ctx context.Context) (string, error) {
 }
 
 func (c *Client) sdr(ctx context.Context, typ string) ([]string, error) {
-	out, err := c.run(ctx, c.bin, "sdr", "type", typ)
+	out, err := c.exec(ctx, "sdr", "type", typ)
 	if err != nil {
 		return nil, fmt.Errorf("ipmitool sdr type %s: %w", typ, err)
 	}
@@ -138,8 +175,8 @@ func (c *Client) sdr(ctx context.Context, typ string) ([]string, error) {
 
 func (c *Client) raw(ctx context.Context, args ...string) error {
 	full := append([]string{"raw"}, args...)
-	if _, err := c.run(ctx, c.bin, full...); err != nil {
-		return fmt.Errorf("ipmitool %s: %w", strings.Join(full, " "), err)
+	if _, err := c.exec(ctx, full...); err != nil {
+		return fmt.Errorf("ipmitool raw %s: %w", strings.Join(args, " "), err)
 	}
 	return nil
 }

@@ -77,6 +77,24 @@ curve:
   before stepping down, so the fans don't hunt at the edge. Upward moves are
   immediate.
 
+### Remote BMCs (out-of-band)
+
+By default fanctl talks to the local BMC in-band via `/dev/ipmi0`. To control a
+remote host's BMC instead, use the out-of-band `lanplus` interface:
+
+```yaml
+connection:
+  interface: lanplus       # "open" (default, in-band) or "lanplus"
+  host: 10.0.0.5
+  username: admin
+  password: ${IPMI_PASSWORD}
+```
+
+Reference the password via an environment variable (expanded at load time) and
+set it in the unit's environment rather than committing a secret to the file.
+One fanctl process per BMC — run it wherever is convenient and point each
+instance at a different host.
+
 ## Safety model
 
 The BMC's automatic thermal management is always the fallback. fanctl returns

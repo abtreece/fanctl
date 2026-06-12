@@ -6,6 +6,16 @@
 # ipmitool binary (name on PATH or absolute path).
 ipmitool: ipmitool
 
+# How fanctl reaches the BMC. The default is in-band (local /dev/ipmi0). To
+# control a remote host's BMC instead, use out-of-band lanplus. Keep the
+# password out of the file by referencing an environment variable, which the
+# loader expands (e.g. set IPMI_PASSWORD in the systemd unit's environment).
+# connection:
+#   interface: lanplus       # "open" (default, in-band) or "lanplus"
+#   host: 10.0.0.5
+#   username: admin
+#   password: ${IPMI_PASSWORD}
+
 # How often to re-read temperatures and adjust fans.
 poll_interval: 30s
 

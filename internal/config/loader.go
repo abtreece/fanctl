@@ -26,6 +26,12 @@ type rawFile struct {
 		MaxTemp int `yaml:"max_temp"`
 		Percent int `yaml:"percent"`
 	} `yaml:"curve"`
+	Connection struct {
+		Interface string `yaml:"interface"`
+		Host      string `yaml:"host"`
+		Username  string `yaml:"username"`
+		Password  string `yaml:"password"`
+	} `yaml:"connection"`
 }
 
 // LoadFile reads a YAML config file and merges its values onto cfg (which the
@@ -69,6 +75,19 @@ func LoadFile(path string, cfg *Config) error {
 			bands[i] = fan.Band{MaxTemp: b.MaxTemp, Percent: b.Percent}
 		}
 		cfg.Curve = bands
+	}
+
+	if raw.Connection.Interface != "" {
+		cfg.Connection.Interface = raw.Connection.Interface
+	}
+	if raw.Connection.Host != "" {
+		cfg.Connection.Host = raw.Connection.Host
+	}
+	if raw.Connection.Username != "" {
+		cfg.Connection.Username = raw.Connection.Username
+	}
+	if raw.Connection.Password != "" {
+		cfg.Connection.Password = raw.Connection.Password
 	}
 
 	return nil

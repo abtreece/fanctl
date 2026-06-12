@@ -64,7 +64,7 @@ func (r *recordingRunner) run(_ context.Context, _ string, args ...string) ([]by
 func newTestController(rr *recordingRunner) *controller {
 	return &controller{
 		log:     slog.New(slog.NewTextHandler(io.Discard, nil)),
-		client:  ipmi.New("ipmitool", rr.run),
+		client:  ipmi.New(ipmi.Options{Bin: "ipmitool"}, rr.run),
 		curve:   fan.Curve{Bands: []fan.Band{{MaxTemp: 50, Percent: 10}, {MaxTemp: 60, Percent: 20}, {MaxTemp: 68, Percent: 30}, {MaxTemp: 75, Percent: 45}}, Hysteresis: 4},
 		sensors: config.SensorConfig{NameMatch: []string{"Temp"}, NameExclude: []string{"Inlet"}},
 		level:   fan.Initial(),

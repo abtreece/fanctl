@@ -33,7 +33,7 @@ Fan Redundancy   | 75h | ok  |  7.1 | Fully Redundant`
 
 func TestTemperatures(t *testing.T) {
 	f := &fakeRunner{responses: map[string]string{"sdr type temperature": sampleTemps}}
-	c := New("ipmitool", f.run)
+	c := New(Options{Bin: "ipmitool"}, f.run)
 	temps, err := c.Temperatures(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -49,7 +49,7 @@ func TestTemperatures(t *testing.T) {
 
 func TestFans(t *testing.T) {
 	f := &fakeRunner{responses: map[string]string{"sdr type fan": sampleFans}}
-	c := New("ipmitool", f.run)
+	c := New(Options{Bin: "ipmitool"}, f.run)
 	fans, err := c.Fans(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -65,7 +65,7 @@ func TestFans(t *testing.T) {
 
 func TestSetPercentEncoding(t *testing.T) {
 	f := &fakeRunner{responses: map[string]string{}}
-	c := New("ipmitool", f.run)
+	c := New(Options{Bin: "ipmitool"}, f.run)
 	if err := c.SetPercent(context.Background(), 30); err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestSetPercentEncoding(t *testing.T) {
 }
 
 func TestSetPercentRange(t *testing.T) {
-	c := New("ipmitool", (&fakeRunner{}).run)
+	c := New(Options{Bin: "ipmitool"}, (&fakeRunner{}).run)
 	if err := c.SetPercent(context.Background(), 101); err == nil {
 		t.Error("SetPercent(101) should error")
 	}
@@ -87,7 +87,7 @@ func TestFirmwareRevision(t *testing.T) {
 	f := &fakeRunner{responses: map[string]string{
 		"mc info": "Device ID                 : 32\nFirmware Revision         : 2.65\nIPMI Version              : 2.0",
 	}}
-	c := New("ipmitool", f.run)
+	c := New(Options{Bin: "ipmitool"}, f.run)
 	rev, err := c.FirmwareRevision(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -97,9 +97,35 @@ func TestFirmwareRevision(t *testing.T) {
 	}
 }
 
+func TestOutOfBandConnectionArgs(t *testing.T) {
+	f := &fakeRunner{responses: map[string]string{}}
+	c := New(Options{Bin: "ipmitool", Interface: "lanplus", Host: "10.0.0.5", Username: "admin", Password: "secret"}, f.run)
+	if err := c.SetAuto(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(f.calls[0], " ")
+	want := "ipmitool -I lanplus -H 10.0.0.5 -U admin -P secret raw 0x30 0x30 0x01 0x01"
+	if got != want {
+		t.Errorf("out-of-band call = %q, want %q", got, want)
+	}
+}
+
+func TestInBandHasNoConnectionArgs(t *testing.T) {
+	f := &fakeRunner{responses: map[string]string{}}
+	c := New(Options{Bin: "ipmitool"}, f.run) // default = in-band
+	if err := c.SetAuto(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(f.calls[0], " ")
+	want := "ipmitool raw 0x30 0x30 0x01 0x01"
+	if got != want {
+		t.Errorf("in-band call = %q, want %q", got, want)
+	}
+}
+
 func TestSDRErrorWraps(t *testing.T) {
 	f := &fakeRunner{err: fmt.Errorf("boom")}
-	c := New("ipmitool", f.run)
+	c := New(Options{Bin: "ipmitool"}, f.run)
 	if _, err := c.Temperatures(context.Background()); err == nil {
 		t.Error("expected error from failing runner")
 	}

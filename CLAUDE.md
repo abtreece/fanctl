@@ -83,7 +83,8 @@ hence config-driven sensor selection and curve rather than hardcoded values.
 
 ## Roadmap
 
+- [x] Optional out-of-band IPMI (lanplus) for remote BMCs — `connection:` config,
+  `ipmi.Options`/`ipmi.New` prepends `-I/-H/-U/-P`.
 - [ ] Config file watch / SIGHUP reload (runnerctl has the pattern to copy).
-- [ ] Optional out-of-band IPMI (lanplus) for remote BMCs.
 - [ ] Prometheus metrics endpoint (fan RPM, selected temp, current level).
 - [ ] Per-zone fan control where the chassis exposes it.

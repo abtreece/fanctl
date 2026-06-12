@@ -37,7 +37,7 @@ func runProbe(args []string) int {
 	}
 
 	cfg := loadConfigOrDefault(*cfgPath)
-	client := ipmi.New(cfg.IPMITool, ipmi.ExecRunner)
+	client := newIPMIClient(cfg)
 	return probe(os.Stdout, os.Stderr, client, probeOptions{
 		low:        *low,
 		settle:     *settle,

@@ -33,7 +33,7 @@ func defaultDoctorDeps() doctorDeps {
 		stat:     os.Stat,
 		lookPath: exec.LookPath,
 		newIPMI: func(cfg *config.Config) doctorIPMI {
-			return ipmi.New(cfg.IPMITool, ipmi.ExecRunner)
+			return newIPMIClient(cfg)
 		},
 	}
 }

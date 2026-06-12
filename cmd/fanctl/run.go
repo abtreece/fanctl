@@ -15,8 +15,20 @@ import (
 
 // runDaemon runs the control loop until SIGINT/SIGTERM, then restores BMC
 // automatic control. With once=true it performs a single iteration and exits.
+// newIPMIClient builds an ipmi.Client from the resolved config (in-band or
+// out-of-band depending on connection.interface).
+func newIPMIClient(cfg *config.Config) *ipmi.Client {
+	return ipmi.New(ipmi.Options{
+		Bin:       cfg.IPMITool,
+		Interface: cfg.Connection.Interface,
+		Host:      cfg.Connection.Host,
+		Username:  cfg.Connection.Username,
+		Password:  cfg.Connection.Password,
+	}, ipmi.ExecRunner)
+}
+
 func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
-	client := ipmi.New(cfg.IPMITool, ipmi.ExecRunner)
+	client := newIPMIClient(cfg)
 	ctrl := &controller{
 		log:     log,
 		client:  client,

@@ -28,6 +28,19 @@ type Config struct {
 	Sensors SensorConfig
 	// Curve is the ascending temperature->percent mapping.
 	Curve []fan.Band
+	// Connection selects in-band (default) or out-of-band BMC access.
+	Connection ConnectionConfig
+}
+
+// ConnectionConfig selects how ipmitool reaches the BMC. The default empty/
+// "open" interface is in-band via /dev/ipmi0. "lanplus" is out-of-band over the
+// network and requires Host (Username/Password are typical). Put credentials in
+// the file via env expansion, e.g. password: ${IPMI_PASSWORD}.
+type ConnectionConfig struct {
+	Interface string
+	Host      string
+	Username  string
+	Password  string
 }
 
 // SensorConfig selects the temperature sensors whose hottest reading drives the
@@ -84,6 +97,7 @@ func Default(path string) *Config {
 			NameMatch:   []string{"Temp"},
 			NameExclude: []string{"Inlet", "Exhaust"},
 		},
+		Connection: ConnectionConfig{Interface: "open"},
 		Curve: []fan.Band{
 			{MaxTemp: 50, Percent: 10},
 			{MaxTemp: 60, Percent: 20},
@@ -106,6 +120,15 @@ func Validate(cfg *Config) error {
 	}
 	if err := cfg.FanCurve().Validate(); err != nil {
 		return fmt.Errorf("curve: %w", err)
+	}
+	switch cfg.Connection.Interface {
+	case "", "open":
+	case "lanplus":
+		if cfg.Connection.Host == "" {
+			return fmt.Errorf("connection.host is required when interface is lanplus")
+		}
+	default:
+		return fmt.Errorf("connection.interface %q is not supported (use open or lanplus)", cfg.Connection.Interface)
 	}
 	return nil
 }
