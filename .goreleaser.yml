@@ -1,0 +1,63 @@
+version: 2
+
+project_name: fanctl
+
+builds:
+  - id: fanctl
+    main: ./cmd/fanctl
+    binary: fanctl
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.ShortCommit}}
+      - -X main.date={{.Date}}
+
+archives:
+  - id: tarballs
+    ids:
+      - fanctl
+    formats:
+      - tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+
+nfpms:
+  - id: packages
+    ids:
+      - fanctl
+    package_name: fanctl
+    vendor: fanctl
+    homepage: https://github.com/abtreece/fanctl
+    maintainer: Andrew Breece <abtreece@users.noreply.github.com>
+    description: Temperature-based BMC fan controller for Dell PowerEdge (IPMI).
+    license: Apache-2.0
+    formats:
+      - deb
+      - rpm
+      - apk
+    file_name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}"
+    bindir: /usr/local/bin
+    recommends:
+      - ipmitool
+    scripts:
+      postinstall: packaging/postinstall.sh
+      preremove: packaging/preremove.sh
+    contents:
+      - src: systemd/fanctl.service
+        dst: /etc/systemd/system/fanctl.service
+        type: config
+      - src: config/config.example.yaml
+        dst: /etc/fanctl/config.example.yaml
+        type: config
+
+release:
+  prerelease: auto

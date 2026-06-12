@@ -1,0 +1,17 @@
+[Unit]
+Description=Temperature-based BMC fan controller for Dell PowerEdge (fanctl)
+Documentation=https://github.com/abtreece/fanctl
+After=systemd-modules-load.service
+ConditionPathExists=/dev/ipmi0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fanctl --config /etc/fanctl/config.yaml
+Restart=always
+RestartSec=10
+# If the daemon stops or dies, restore the BMC's automatic fan control so the
+# fans are never left pinned. (fanctl also does this on clean shutdown.)
+ExecStopPost=/usr/bin/ipmitool raw 0x30 0x30 0x01 0x01
+
+[Install]
+WantedBy=multi-user.target

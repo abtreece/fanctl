@@ -1,0 +1,5 @@
+/fanctl
+/dist/
+*.deb
+*.rpm
+*.apk

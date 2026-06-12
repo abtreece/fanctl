@@ -1,0 +1,38 @@
+# fanctl configuration — temperature-based BMC fan control for Dell PowerEdge.
+#
+# All fields are optional; omitted fields fall back to the built-in defaults
+# shown here. Defaults target a Dell 12G/13G host (R420/R430-class).
+
+# ipmitool binary (name on PATH or absolute path).
+ipmitool: ipmitool
+
+# How often to re-read temperatures and adjust fans.
+poll_interval: 30s
+
+# Downward hysteresis in °C: the controller only steps to a cooler/quieter band
+# once the temperature has fallen this far below the lower band's ceiling. Stops
+# the fans hunting at a boundary.
+hysteresis: 4
+
+# Which temperature sensors drive the curve. If `ids` is set it wins; otherwise
+# a sensor is selected when its name contains any `name_match` substring and
+# none of `name_exclude` (case-insensitive). The default picks the CPU sensors
+# on most Dell generations. Run `fanctl doctor` to see what your host exposes,
+# or pin exact SDR record ids, e.g.:
+#   ids: ["0Eh", "0Fh"]
+sensors:
+  name_match: ["Temp"]
+  name_exclude: ["Inlet", "Exhaust"]
+
+# Fan curve: ascending temperature ceilings (°C) -> fan duty percent. A
+# temperature above the hottest band hands control back to the BMC's automatic
+# thermal management, which is always the safe fallback.
+curve:
+  - max_temp: 50
+    percent: 10
+  - max_temp: 60
+    percent: 20
+  - max_temp: 68
+    percent: 30
+  - max_temp: 75
+    percent: 45
