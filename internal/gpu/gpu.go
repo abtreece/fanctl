@@ -7,17 +7,19 @@ package gpu
 import (
 	"context"
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
+
+	"github.com/abtreece/fanctl/internal/runcmd"
 )
 
 // Runner executes a command and returns its combined output. Injected for tests.
 type Runner func(ctx context.Context, name string, args ...string) ([]byte, error)
 
-// ExecRunner is the default Runner: it shells out to the real binary.
+// ExecRunner is the default Runner: it shells out to the real binary, honouring
+// ctx's deadline even if nvidia-smi wedges against a hung GPU.
 func ExecRunner(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+	return runcmd.CombinedOutput(ctx, name, args...)
 }
 
 // Reader queries GPU temperatures through nvidia-smi.

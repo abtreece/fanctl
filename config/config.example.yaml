@@ -25,6 +25,14 @@ poll_interval: 30s
 # poll_interval_hot: 5s
 # hot_duty: 50
 
+# Deadline for one control iteration's BMC I/O. A wedged ipmitool (a busy iDRAC,
+# or a stalled lanplus connection) must never block the loop indefinitely, since
+# that would leave the fans pinned at the last commanded duty with no path back
+# to BMC automatic control. Capped at the shortest poll cadence in play. Raise it
+# for a slow BMC — and raise WatchdogSec in the systemd unit to match. Changing
+# this needs a restart, not a reload.
+step_timeout: 15s
+
 # Hysteresis in °C: after handing control to the BMC on over-temp, manual
 # control is only reclaimed once the temperature has fallen this far below the
 # curve's top anchor, which stops flapping at the handoff boundary.

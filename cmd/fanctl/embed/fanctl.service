@@ -2,16 +2,28 @@
 Description=Temperature-based BMC fan controller for Dell PowerEdge (fanctl)
 Documentation=https://github.com/abtreece/fanctl
 After=systemd-modules-load.service
-ConditionPathExists=/dev/ipmi0
+# No ConditionPathExists=/dev/ipmi0 here: with connection.interface=lanplus
+# fanctl drives a remote BMC and there is no local IPMI device to gate on.
+# `fanctl doctor` checks for /dev/ipmi0 on in-band hosts instead.
 
 [Service]
-Type=simple
+# notify: fanctl signals READY=1 once its first control step has run, so
+# `systemctl start` returns only after the fans are actually under management.
+Type=notify
+NotifyAccess=main
+# The watchdog is pinged only while the control loop is still servicing its
+# select, so a wedged ipmitool gets the unit restarted rather than leaving the
+# fans pinned at their last commanded duty. Must comfortably exceed
+# step_timeout (default 15s); raise both together if your BMC is slow.
+WatchdogSec=90
 ExecStart=/usr/local/bin/fanctl --config /etc/fanctl/config.yaml
 Restart=always
 RestartSec=10
 # If the daemon stops or dies, restore the BMC's automatic fan control so the
-# fans are never left pinned. (fanctl also does this on clean shutdown.)
-ExecStopPost=/usr/bin/ipmitool raw 0x30 0x30 0x01 0x01
+# fans are never left pinned. (fanctl also does this on clean shutdown.) Routed
+# through fanctl rather than a raw ipmitool call so it honours an out-of-band
+# connection and does not hardcode ipmitool's path, which differs across distros.
+ExecStopPost=/usr/local/bin/fanctl restore-auto --config /etc/fanctl/config.yaml
 
 [Install]
 WantedBy=multi-user.target

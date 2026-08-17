@@ -72,6 +72,39 @@ func TestLoadFileMissingKeepsDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadFileStepTimeout(t *testing.T) {
+	path := writeTemp(t, "step_timeout: 40s\n")
+	cfg := Default(path)
+	if err := LoadFile(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.StepTimeout != 40*time.Second {
+		t.Fatalf("step_timeout = %s, want 40s", cfg.StepTimeout)
+	}
+}
+
+func TestLoadFileBadStepTimeout(t *testing.T) {
+	path := writeTemp(t, "step_timeout: soon\n")
+	if err := LoadFile(path, Default(path)); err == nil {
+		t.Fatal("expected an error for an unparseable step_timeout")
+	}
+}
+
+// A step must never outlive the tick that scheduled it, or steps would overlap.
+func TestEffectiveStepTimeoutCappedAtPollInterval(t *testing.T) {
+	cfg := Default("x")
+	cfg.PollInterval = 5 * time.Second
+	cfg.StepTimeout = 15 * time.Second
+	if got := cfg.EffectiveStepTimeout(); got != 5*time.Second {
+		t.Fatalf("EffectiveStepTimeout = %s, want it capped to 5s", got)
+	}
+
+	cfg.PollInterval = 30 * time.Second
+	if got := cfg.EffectiveStepTimeout(); got != 15*time.Second {
+		t.Fatalf("EffectiveStepTimeout = %s, want the configured 15s", got)
+	}
+}
+
 func TestValidate(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -83,6 +116,8 @@ func TestValidate(t *testing.T) {
 		{"lanplus with host ok", func(c *Config) { c.Connection.Interface = "lanplus"; c.Connection.Host = "h" }, false},
 		{"bad interface", func(c *Config) { c.Connection.Interface = "serial" }, true},
 		{"sub-second poll", func(c *Config) { c.PollInterval = time.Millisecond }, true},
+		{"zero step timeout", func(c *Config) { c.StepTimeout = 0 }, true},
+		{"negative step timeout", func(c *Config) { c.StepTimeout = -time.Second }, true},
 		{"no sensor selector", func(c *Config) { c.Sensors.NameMatch = nil; c.Sensors.IDs = nil }, true},
 	}
 	for _, tt := range tests {

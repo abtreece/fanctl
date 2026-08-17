@@ -29,6 +29,10 @@ type Config struct {
 	// HotDuty is the commanded duty percent at or above which the hot poll
 	// cadence is used.
 	HotDuty int
+	// StepTimeout bounds the BMC I/O of a single control iteration. A wedged
+	// ipmitool must never stall the loop indefinitely, since a stalled loop
+	// leaves the fans pinned at the last commanded duty.
+	StepTimeout time.Duration
 	// Hysteresis is the downward °C margin before reclaiming manual control
 	// from BMC automatic mode.
 	Hysteresis int
@@ -147,6 +151,20 @@ func (c *Config) Governor() fan.Governor {
 // wind down smoothly after load drops; not currently configurable.
 const maxStepDown = 10
 
+// EffectiveStepTimeout is the deadline applied to one control iteration. It is
+// capped at the shortest poll cadence in play — the hot one when adaptive
+// polling is enabled — so a slow step can never run past the next tick.
+func (c *Config) EffectiveStepTimeout() time.Duration {
+	shortest := c.PollInterval
+	if c.PollIntervalHot > 0 && c.PollIntervalHot < shortest {
+		shortest = c.PollIntervalHot
+	}
+	if c.StepTimeout > shortest {
+		return shortest
+	}
+	return c.StepTimeout
+}
+
 // Default returns a Config seeded with built-in defaults for the given path.
 func Default(path string) *Config {
 	return &Config{
@@ -155,6 +173,7 @@ func Default(path string) *Config {
 		PollInterval:     30 * time.Second,
 		PollIntervalHot:  0,
 		HotDuty:          50,
+		StepTimeout:      15 * time.Second,
 		Hysteresis:       4,
 		Deadband:         3,
 		Lookahead:        1.5,
@@ -181,6 +200,9 @@ func Validate(cfg *Config) error {
 	}
 	if cfg.PollInterval < time.Second {
 		return fmt.Errorf("poll_interval must be >= 1s; got %s", cfg.PollInterval)
+	}
+	if cfg.StepTimeout <= 0 {
+		return fmt.Errorf("step_timeout must be > 0; got %s", cfg.StepTimeout)
 	}
 	if len(cfg.Sensors.IDs) == 0 && len(cfg.Sensors.NameMatch) == 0 {
 		return fmt.Errorf("sensors: set at least one of ids or name_match")

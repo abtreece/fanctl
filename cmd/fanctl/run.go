@@ -57,9 +57,16 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 	ctrl := &controller{log: log, client: client, gpu: gpuReader, dryRun: dryRun, now: time.Now}
 	ctrl.setTunables(tunablesFrom(cfg))
 
+	// Every BMC round-trip is bounded: a wedged ipmitool must never stall the
+	// loop, because a stalled loop leaves the fans pinned at the last commanded
+	// duty with no path back to BMC automatic control.
+	stepTimeout := cfg.EffectiveStepTimeout()
+
 	if once {
 		// Single shot: report what it would do and leave control as set.
-		return ctrl.step(context.Background())
+		stepCtx, cancel := context.WithTimeout(context.Background(), stepTimeout)
+		defer cancel()
+		return ctrl.step(stepCtx)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -68,6 +75,7 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 	log.Info("fanctl starting",
 		"poll_interval", cfg.PollInterval,
 		"poll_interval_hot", cfg.PollIntervalHot,
+		"step_timeout", stepTimeout,
 		"hysteresis", cfg.Hysteresis,
 		"deadband", cfg.Deadband,
 		"lookahead_min", cfg.Lookahead,
@@ -94,17 +102,20 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 			log.Warn("reload: invalid config; keeping current config", "err", err)
 			return
 		}
-		// Connection and ipmitool binary are bound into the client at startup;
-		// changing them needs a restart.
-		if fresh.IPMITool != cfg.IPMITool || fresh.Connection != cfg.Connection {
-			log.Warn("reload: connection/ipmitool changes require a restart and were not applied")
+		// Connection and ipmitool binary are bound into the client at startup.
+		// step_timeout is fixed too: the watchdog's grace period is derived from
+		// it, so changing one without the other would desync them.
+		if fresh.IPMITool != cfg.IPMITool || fresh.Connection != cfg.Connection || fresh.StepTimeout != cfg.StepTimeout {
+			log.Warn("reload: connection/ipmitool/step_timeout changes require a restart and were not applied")
 		}
 		ctrl.setTunables(tunablesFrom(fresh))
 		ctrl.recordReload()
-		// Keep the connection/ipmitool the client was built with so the
-		// in-memory config never disagrees with the running client.
+		// Keep the connection/ipmitool the client was built with, and the
+		// step_timeout the loop is running with, so the in-memory config never
+		// disagrees with what is actually in effect.
 		fresh.IPMITool = cfg.IPMITool
 		fresh.Connection = cfg.Connection
+		fresh.StepTimeout = cfg.StepTimeout
 		*cfg = *fresh
 		select {
 		case intervalCh <- struct{}{}:
@@ -157,12 +168,29 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 	}
 
 	step := func() {
-		if err := ctrl.step(ctx); err != nil {
-			log.Warn("control step failed; handing to BMC automatic control", "err", err)
-			ctrl.fallbackAuto(ctx)
-		}
+		ctrl.runStep(ctx, stepTimeout)
 	}
 	step()
+
+	// Tell systemd we are up only after the first control step, so `systemctl
+	// start` blocks until the fans are actually under management.
+	if err := sdNotify("READY=1"); err != nil {
+		log.Warn("systemd READY notification failed", "err", err)
+	}
+
+	// health carries the watchdog's liveness probe. It is unbuffered on purpose:
+	// the send only completes when the loop below actually receives it, so a
+	// wedged loop withholds the watchdog ping and systemd restarts us.
+	health := make(chan struct{})
+	if wd := watchdogInterval(); wd > 0 {
+		grace := watchdogGrace(stepTimeout, wd)
+		if grace < stepTimeout {
+			log.Warn("WatchdogSec is small relative to step_timeout; a slow BMC may trip the watchdog",
+				"watchdog_interval", wd, "step_timeout", stepTimeout, "grace", grace)
+		}
+		log.Info("systemd watchdog enabled", "interval", wd, "grace", grace)
+		go runWatchdog(ctx, log, health, wd, grace)
+	}
 
 	current := ctrl.desiredInterval()
 	ticker := time.NewTicker(current)
@@ -180,6 +208,8 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 		case <-ctx.Done():
 			log.Info("shutting down, restoring BMC automatic control")
 			return nil
+		case <-health:
+			// Watchdog liveness probe; receiving it is the whole response.
 		case <-intervalCh:
 			retick()
 		case <-ticker.C:
@@ -219,6 +249,25 @@ func tunablesFrom(cfg *config.Config) tunables {
 		hotDuty:   cfg.HotDuty,
 		reassert:  cfg.ReassertInterval,
 	}
+}
+
+// runStep performs one control iteration under a deadline, handing the fans
+// back to BMC automatic control if it fails or times out.
+func (c *controller) runStep(ctx context.Context, timeout time.Duration) {
+	stepCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	err := c.step(stepCtx)
+	if err == nil {
+		return
+	}
+	// A killed ipmitool surfaces as "signal: killed" rather than the context
+	// error, so ask the context itself whether the deadline was the cause.
+	if errors.Is(stepCtx.Err(), context.DeadlineExceeded) {
+		c.log.Warn("control step timed out; handing to BMC automatic control", "timeout", timeout)
+	} else {
+		c.log.Warn("control step failed; handing to BMC automatic control", "err", err)
+	}
+	c.fallbackAuto(ctx, timeout)
 }
 
 // controller holds the loop state. Tunables are mutex-guarded so a reload can
@@ -511,11 +560,15 @@ func (c *controller) applyState(ctx context.Context, s fan.State, reason string)
 }
 
 // fallbackAuto forces BMC automatic control after an error, bypassing
-// change-detection so the safe state is always re-asserted.
-func (c *controller) fallbackAuto(ctx context.Context) {
+// change-detection so the safe state is always re-asserted. It takes its own
+// deadline: the step may well have failed because the BMC is unresponsive, and
+// the recovery path must not inherit that hang.
+func (c *controller) fallbackAuto(ctx context.Context, timeout time.Duration) {
 	if c.dryRun {
 		return
 	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	if err := c.client.SetAuto(ctx); err != nil {
 		c.log.Warn("fallback set auto failed", "err", err)
 		return

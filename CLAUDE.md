@@ -33,9 +33,12 @@ cmd/fanctl/run.go         — daemon: control loop + controller (change-detectio
 cmd/fanctl/doctor.go      — preflight checks; ok/warn/FAIL report, DI via doctorDeps
 cmd/fanctl/probe.go       — controllability sweep: command low duty, measure RPM drop
 cmd/fanctl/install.go     — //go:embed systemd unit + example config; write + enable
+cmd/fanctl/restore.go     — `restore-auto` subcommand; what the unit's ExecStopPost runs
+cmd/fanctl/watchdog.go    — sd_notify (no dep) + loop-liveness watchdog pings
 cmd/fanctl/embed/         — embedded fanctl.service + config.example.yaml
+internal/runcmd/          — exec helper whose deadline holds even if the child can't be killed
 internal/ipmi/ipmi.go     — ipmitool wrapper; injectable Runner; SDR parsing, raw set commands
-internal/fan/curve.go     — PURE curve logic: Level(prev,temp) with hysteresis; no I/O
+internal/fan/curve.go     — PURE policy: Curve.Duty interpolation + Governor + Predictor; no I/O
 internal/config/          — Config + SensorConfig + Default(); rawFile YAML loader + Validate
 systemd/fanctl.service    — packaged unit (mirror of embed copy)
 config/config.example.yaml — packaged example (mirror of embed copy)
@@ -73,6 +76,27 @@ packaging/                — nfpm postinstall/preremove (preremove restores BMC
 - **Sensor selection:** explicit SDR `ids` win; otherwise name include/exclude
   (default match "Temp", exclude "Inlet"/"Exhaust") picks CPU sensors across
   Dell generations.
+- **A hang is not a safe state.** Fallback-to-auto only protects against *errors*;
+  a wedged `ipmitool` used to stall the loop forever with the fans pinned and no
+  path back to BMC auto. Three layers now prevent that: `step_timeout` (default
+  15s, capped at the shortest poll cadence in play) bounds each iteration and its
+  fallback;
+  `internal/runcmd` makes that deadline hold even when the child ignores SIGKILL
+  (`exec.CommandContext` + `CombinedOutput` blocks while any grandchild holds the
+  output pipe, and a process stuck in an uninterruptible `/dev/ipmi0` ioctl cannot
+  be killed at all); and the systemd watchdog restarts the unit if the loop stops
+  servicing its select. `step_timeout` is restart-only — the watchdog grace period
+  is derived from it.
+- **The watchdog pings from the control loop, not a timer.** `runWatchdog` proves
+  liveness by sending on an unbuffered channel the loop must receive. A goroutine
+  pinging on a timer would keep a wedged daemon alive, which is the exact failure
+  being guarded against.
+- **`restore-auto` instead of a raw command in the unit.** `ExecStopPost` cannot
+  know the connection: a `lanplus` host has no local `/dev/ipmi0`, and `ipmitool`
+  is in `/usr/bin` on Debian-family and `/usr/sbin` on RHEL-family. Routing through
+  fanctl reuses the configured connection. For the same reason the unit no longer
+  carries `ConditionPathExists=/dev/ipmi0`, which silently blocked out-of-band
+  deployments from starting at all; `doctor` checks the device instead.
 
 ## Origin
 

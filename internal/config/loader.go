@@ -17,6 +17,7 @@ type rawFile struct {
 	IPMITool         string   `yaml:"ipmitool"`
 	PollInterval     string   `yaml:"poll_interval"`
 	PollIntervalHot  string   `yaml:"poll_interval_hot"`
+	StepTimeout      string   `yaml:"step_timeout"`
 	HotDuty          *int     `yaml:"hot_duty"`
 	Hysteresis       *int     `yaml:"hysteresis"`
 	Deadband         *int     `yaml:"deadband"`
@@ -79,6 +80,13 @@ func LoadFile(path string, cfg *Config) error {
 			return fmt.Errorf("poll_interval_hot: %w", err)
 		}
 		cfg.PollIntervalHot = d
+	}
+	if raw.StepTimeout != "" {
+		d, err := time.ParseDuration(raw.StepTimeout)
+		if err != nil {
+			return fmt.Errorf("step_timeout: %w", err)
+		}
+		cfg.StepTimeout = d
 	}
 	if raw.HotDuty != nil {
 		cfg.HotDuty = *raw.HotDuty

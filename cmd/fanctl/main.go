@@ -39,6 +39,8 @@ func main() {
 			os.Exit(runProbe(os.Args[2:]))
 		case "install":
 			os.Exit(runInstall(os.Args[2:]))
+		case "restore-auto":
+			os.Exit(runRestoreAuto(os.Args[2:]))
 		case "run":
 			// `fanctl run [flags]` is an explicit alias for the bare daemon.
 			os.Args = append(os.Args[:1], os.Args[2:]...)
@@ -48,7 +50,7 @@ func main() {
 	var cli CLI
 	ctx := kong.Parse(&cli,
 		kong.Name("fanctl"),
-		kong.Description("Temperature-based BMC fan controller for Dell PowerEdge (IPMI).\n\nSubcommands: doctor (preflight checks), probe (confirm manual fan control works), install (systemd unit + config)."),
+		kong.Description("Temperature-based BMC fan controller for Dell PowerEdge (IPMI).\n\nSubcommands: doctor (preflight checks), probe (confirm manual fan control works), install (systemd unit + config), restore-auto (hand fans back to the BMC)."),
 		kong.UsageOnError(),
 		kong.ConfigureHelp(kong.HelpOptions{Compact: true}),
 		kong.Vars{
