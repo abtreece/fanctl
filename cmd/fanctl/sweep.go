@@ -79,7 +79,22 @@ func runSweep(args []string) int {
 		return 2
 	}
 
-	cfg := loadConfigOrDefault(*cfgPath)
+	// Unlike doctor and probe, sweep insists on the config it was pointed at.
+	// Falling back to built-in defaults would silently clear gpu.enabled, and a
+	// sweep is the one subcommand that deliberately drives duty toward zero:
+	// being GPU-blind here is exactly the unsafe state the daemon refuses to
+	// enter. A typo'd -config must fail, not quietly widen the envelope.
+	cfg := config.Default(*cfgPath)
+	if err := config.LoadFile(*cfgPath, cfg); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "sweep: %v\n", err)
+		_, _ = fmt.Fprintln(os.Stderr, "  sweep needs the host's config (sensor selection, connection, gpu.enabled)")
+		_, _ = fmt.Fprintln(os.Stderr, "  point it at one with -config, or write one with: fanctl install")
+		return 2
+	}
+	if err := config.Validate(cfg); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "sweep: %s: %v\n", *cfgPath, err)
+		return 2
+	}
 
 	// On a GPU host the card is the thermally interesting part — a passively
 	// cooled T4 lives on chassis airflow — so a sweep that only watched IPMI
@@ -87,6 +102,8 @@ func runSweep(args []string) int {
 	var gpuReader gpuTempReader
 	if cfg.GPU.Enabled {
 		gpuReader = gpu.New(cfg.GPU.Command, gpu.ExecRunner)
+	} else {
+		_, _ = fmt.Fprintf(os.Stderr, "sweep: gpu monitoring is off in %s; this sweep watches IPMI sensors only\n", *cfgPath)
 	}
 
 	return sweep(os.Stdout, os.Stderr, newIPMIClient(cfg), sweepOptions{
@@ -157,13 +174,25 @@ func (s sweepSample) spreadPct() int {
 }
 
 const (
-	// unevenSpreadPct is the spread above which fans are no longer tracking
-	// duty together.
-	unevenSpreadPct = 25
-	// clampDropPct is the minimum RPM fall between consecutive steps, relative
-	// to the previous step, below which the firmware is treated as clamping and
-	// lower duties as pointless.
-	clampDropPct = 5
+	// unevenSpreadRisePct is how many points of spread a step may gain over the
+	// sweep's own reference spread before the fans count as no longer tracking
+	// duty together. It is a *rise*, not an absolute, because chassis differ:
+	// an R430 idles with its fans 37% apart at every duty, so an absolute
+	// threshold would call a perfectly linear host broken at the first step.
+	// What signals breakdown is the spread opening up as duty falls.
+	unevenSpreadRisePct = 15
+	// unevenSpreadAbsPct is a ceiling that applies however wide the reference
+	// spread was, so a host whose very first step is already incoherent is not
+	// endorsed just because nothing got worse afterwards.
+	unevenSpreadAbsPct = 60
+	// clampSlopeFracPct is the fraction of the steepest response seen so far
+	// that a step's RPM-per-duty-point slope may fall to before the firmware is
+	// treated as clamping. Comparing slopes rather than raw RPM drops keeps the
+	// test independent of how finely the sweep was stepped.
+	clampSlopeFracPct = 25
+	// clampMinSlopeRPM catches a sweep that starts out already clamped, where
+	// there is no healthy slope to compare against.
+	clampMinSlopeRPM = 10
 	// restoreTimeout bounds the hand-back to BMC automatic control.
 	restoreTimeout = 15 * time.Second
 )
@@ -421,6 +450,12 @@ func dutyLabel(s sweepSample) string {
 // longer controls anything. Judging each step in isolation would pick one of
 // those and recommend a floor below the point where control was already lost.
 func analyseSweep(samples []sweepSample) (best sweepSample, reason string, ok bool) {
+	ref := referenceSpread(samples)
+	limit := ref + unevenSpreadRisePct
+	if limit > unevenSpreadAbsPct {
+		limit = unevenSpreadAbsPct
+	}
+	steepest := 0
 	for _, s := range samples {
 		if s.Duty < 0 {
 			continue // baseline is not a commanded step
@@ -428,18 +463,42 @@ func analyseSweep(samples []sweepSample) (best sweepSample, reason string, ok bo
 		if s.Aborted != "" {
 			return best, fmt.Sprintf("at %d%% the sweep aborted: %s", s.Duty, s.Aborted), ok
 		}
-		if sp := s.spreadPct(); sp > unevenSpreadPct {
-			return best, fmt.Sprintf("at %d%% the fans stopped tracking together (spread %d%% > %d%%)",
-				s.Duty, sp, unevenSpreadPct), ok
+		if sp := s.spreadPct(); sp > limit {
+			return best, fmt.Sprintf("at %d%% the fans stopped tracking together (spread %d%%, was %d%% at the top of the sweep)",
+				s.Duty, sp, ref), ok
 		}
 		// best is the last accepted step, so it is also the previous one.
-		if ok && best.AvgRPM-s.AvgRPM < best.AvgRPM*clampDropPct/100 {
-			return best, fmt.Sprintf("at %d%% RPM stopped responding to duty (%d -> %d), so the firmware is clamping",
-				s.Duty, best.AvgRPM, s.AvgRPM), ok
+		if ok {
+			slope := (best.AvgRPM - s.AvgRPM) / max(best.Duty-s.Duty, 1)
+			if slope < clampMinSlopeRPM || (steepest > 0 && slope < steepest*clampSlopeFracPct/100) {
+				return best, fmt.Sprintf("at %d%% RPM stopped responding to duty (%d -> %d, %d RPM per point against %d earlier), so the firmware is clamping",
+					s.Duty, best.AvgRPM, s.AvgRPM, slope, steepest), ok
+			}
+			if slope > steepest {
+				steepest = slope
+			}
 		}
 		best, ok = s, true
 	}
 	return best, "", ok
+}
+
+// referenceSpread is the spread the host shows before duty is wound down: the
+// baseline reading if the sweep took one, else its first commanded step. Fans
+// of different sizes and positions never turn at the same rate, so this is the
+// zero point the later steps are judged against.
+func referenceSpread(samples []sweepSample) int {
+	for _, s := range samples {
+		if s.Duty < 0 {
+			return s.spreadPct()
+		}
+	}
+	for _, s := range samples {
+		if s.Duty >= 0 {
+			return s.spreadPct()
+		}
+	}
+	return 0
 }
 
 // quieterDB estimates the noise change from an RPM change. Fan noise power

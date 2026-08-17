@@ -84,7 +84,19 @@ packaging/                — nfpm postinstall/preremove (preremove restores BMC
   several °C higher), and without `gpu.enabled` it cannot see passively-cooled
   cards with no temperature sensor of their own. With `gpu.enabled` it reads the
   GPU as well, and an unreadable GPU aborts the sweep — same fail-safe invariant
-  as the daemon.
+  as the daemon. To keep that invariant true, sweep (unlike doctor and probe)
+  *requires* the config it was pointed at: falling back to defaults would clear
+  `gpu.enabled` and leave a T4 unwatched during the one operation that
+  deliberately drives duty toward zero.
+- **Both `-suggest` breakdown tests are relative, not absolute.** Fan spread is
+  judged as a *rise* over the sweep's own reference spread (baseline, else the
+  top step), because the R430 idles with its fans 37% apart at every duty and an
+  absolute threshold called that host broken at the first step. The clamp test
+  compares RPM-per-duty-point slope against the steepest slope seen so far, not
+  a raw RPM drop against a percentage of the previous step, so the verdict does
+  not change with how finely the sweep was stepped. An absolute spread ceiling
+  and an absolute minimum slope still catch hosts that are already incoherent or
+  already clamped at the first step, where there is no healthy reference.
 - **Lowering the idle floor on a GPU host means lowering both curves.** The
   daemon commands `max(cpuCurveDuty, gpuCurveDuty)` (`run.go`) and `Curve.Duty`
   is flat below its first anchor, so a `gpu.curve` starting at `55 → 20` holds

@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -345,6 +347,91 @@ func TestAnalyseReportsNothingUsableWhenFirstStepFails(t *testing.T) {
 	}
 }
 
+// javelin (R430, Tesla T4) idles with its fans 37% apart under BMC automatic
+// control and stays that way all the way down -- 2760 against 3960 RPM at one
+// commanded duty is how the chassis is built, not a fault. Measured on the host
+// 2026-08-17; an absolute spread threshold called the very first step broken
+// and reported "no step was usable" for a host whose control is linear to 6%.
+func TestAnalyseToleratesAChassisThatIsAlwaysUneven(t *testing.T) {
+	samples := []sweepSample{
+		{Duty: -1, AvgRPM: 2868, MinRPM: 2520, MaxRPM: 3600},
+		sample(10, 3120, 2760, 3960),
+		sample(8, 2796, 2400, 3600),
+		sample(6, 2508, 2160, 3240),
+	}
+	best, reason, ok := analyseSweep(samples)
+	if !ok {
+		t.Fatalf("a host whose fans are merely unequal must still yield a floor (reason %q)", reason)
+	}
+	if best.Duty != 6 {
+		t.Errorf("suggested floor = %d%% (reason %q), want 6%%", best.Duty, reason)
+	}
+}
+
+// The spread test judges a rise over the sweep's own reference, so a chassis
+// that starts tidy and comes apart must still be caught -- the rise is what
+// carries the signal, and toleration of a wide baseline must not cost that.
+func TestAnalyseStillCatchesSpreadOpeningUpFromATidyBaseline(t *testing.T) {
+	samples := []sweepSample{
+		{Duty: -1, AvgRPM: 3000, MinRPM: 2940, MaxRPM: 3060},
+		sample(10, 3000, 2940, 3060), // 4% spread
+		sample(6, 2400, 2100, 2700),  // 25% spread: +21 over reference
+	}
+	best, reason, ok := analyseSweep(samples)
+	if !ok {
+		t.Fatal("expected a usable step")
+	}
+	if best.Duty != 10 {
+		t.Errorf("suggested floor = %d%%, want 10%%: the fans came apart at 6%%", best.Duty)
+	}
+	if !strings.Contains(reason, "tracking") {
+		t.Errorf("reason = %q, want it to name the tracking failure", reason)
+	}
+}
+
+// javelin measures ~156 RPM per duty point, linear, with no firmware clamp.
+// Whether that is sampled every point or every ten, the verdict must be the
+// same: comparing raw RPM drops against a percentage of the previous step made
+// a fine-grained sweep of a linear host report a clamp at the second step.
+func TestAnalyseVerdictDoesNotDependOnStepGranularity(t *testing.T) {
+	for _, gap := range []int{1, 2, 5, 10} {
+		var samples []sweepSample
+		rpm := 6108
+		for duty := 30; duty >= 10; duty -= gap {
+			samples = append(samples, sample(duty, rpm, rpm-90, rpm+90))
+			rpm -= 156 * gap
+		}
+		best, reason, ok := analyseSweep(samples)
+		if !ok {
+			t.Fatalf("gap %d: expected a usable step (reason %q)", gap, reason)
+		}
+		if best.Duty != 10 {
+			t.Errorf("gap %d: suggested floor = %d%% (reason %q), want 10%%: RPM fell 156 per point throughout",
+				gap, best.Duty, reason)
+		}
+	}
+}
+
+// A host that is clamped from the very first interval has no healthy slope to
+// be compared against, so the absolute floor has to carry the detection.
+func TestAnalyseDetectsAClampPresentFromTheFirstStep(t *testing.T) {
+	samples := []sweepSample{
+		sample(30, 3000, 2940, 3060),
+		sample(20, 2980, 2920, 3040),
+		sample(10, 2960, 2900, 3020),
+	}
+	best, reason, ok := analyseSweep(samples)
+	if !ok {
+		t.Fatal("expected the first step to stand as a floor")
+	}
+	if best.Duty != 30 {
+		t.Errorf("suggested floor = %d%%, want 30%%: duty never moved the fans", best.Duty)
+	}
+	if !strings.Contains(reason, "clamping") {
+		t.Errorf("reason = %q, want it to report a firmware clamp", reason)
+	}
+}
+
 func TestSuggestionWarnsAboutEquilibriumAndHiddenCards(t *testing.T) {
 	samples := []sweepSample{
 		sample(10, 3050, 2880, 3360),
@@ -357,6 +444,31 @@ func TestSuggestionWarnsAboutEquilibriumAndHiddenCards(t *testing.T) {
 	for _, want := range []string{"6%", "EQUILIBRIUM", "passively-cooled"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("suggestion missing %q\n%s", want, got)
+		}
+	}
+}
+
+// --- config -----------------------------------------------------------------
+
+// Falling back to built-in defaults would clear gpu.enabled, and sweep is the
+// subcommand that drives duty toward zero: a typo'd -config used to leave a
+// passively-cooled card unwatched with nothing said about it. It must refuse to
+// run rather than quietly widen its own safety envelope.
+func TestSweepRefusesToRunWithoutTheConfigItWasGiven(t *testing.T) {
+	bad := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(bad, []byte("gpu:\n  enabled: [not, a, bool]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Exit 2 is usage-refused, and it is the assertion that matters: it is the
+	// only outcome reachable without contacting the BMC, so it proves the sweep
+	// stopped rather than went ahead on defaults. (A 1 would mean it started and
+	// something downstream failed.)
+	for _, tc := range []struct{ name, path string }{
+		{"absent", filepath.Join(t.TempDir(), "nope.yaml")},
+		{"malformed", bad},
+	} {
+		if code := runSweep([]string{"-config", tc.path, "-steps", "10", "-settle", "1ms", "-force"}); code != 2 {
+			t.Errorf("%s config: runSweep = %d, want 2; it must refuse rather than run GPU-blind on defaults", tc.name, code)
 		}
 	}
 }
