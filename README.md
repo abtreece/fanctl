@@ -43,10 +43,94 @@ sudo ./fanctl install                    # writes unit + /etc/fanctl/config.yaml
 | `fanctl` (or `fanctl run`) | Run the control loop (the daemon). |
 | `fanctl doctor` | Preflight: ipmitool present, `/dev/ipmi0`, firmware revision, sensor selection, fan readings. |
 | `fanctl probe` | Command a low duty and measure the RPM drop to confirm manual fan control works. |
+| `fanctl sweep` | Step duty down through a range, measuring RPM and temperature at each, to pick a curve floor. |
 | `fanctl install` | Write the systemd unit and an initial config, then enable the service. |
+| `fanctl restore-auto` | Hand the fans back to the BMC's automatic control. What the unit's `ExecStopPost` runs. |
 
 Useful daemon flags: `--dry-run` (compute and log, never write to the BMC),
 `--once` (a single iteration then exit), `--config PATH`, `--log-level`.
+
+### Choosing a curve floor with `sweep`
+
+Below its lowest anchor the curve is flat, so that anchor's percent *is* the
+idle duty — and the quietest useful value for it is a property of the host, not
+something to guess. `sweep` measures it:
+
+```sh
+sudo systemctl stop fanctl               # a running daemon would fight the sweep
+sudo fanctl sweep -suggest
+sudo systemctl start fanctl
+```
+
+```
+DUTY      AVG RPM  MIN   MAX   SPREAD  TEMP  INLET
+baseline  2740     2640  3000  13%     45°C  24°C
+10%       3040     2880  3360  15%     45°C  24°C
+8%        2740     2640  3000  13%     44°C  24°C
+6%        2420     2160  2520  14%     44°C  24°C
+4%        2030     1560  2280  35%     45°C  24°C
+2%        1820     1560  1920  19%     44°C  24°C
+0%        1560     1440  1680  15%     53°C  24°C
+
+suggested floor: 6% -- 2420 RPM, about 5 dB quieter than 10% (estimated from RPM)
+  lower steps rejected: at 4% the fans stopped tracking together (spread 35%, was 13% at the top of the sweep)
+```
+
+The sweep visits every step you give it; `-suggest` is what decides which are
+usable. It walks them from most to least airflow and stops at the first sign
+that duty no longer controls the fans:
+
+- **Fan spread opening up** — some fans have hit their own floor while others
+  still follow the commanded duty. This is judged as a *rise* over the sweep's
+  own reference spread, not an absolute: chassis differ, and a host whose fans
+  normally sit 37% apart at every duty is not broken. An absolute ceiling still
+  applies for a host that is already incoherent at the first step.
+- **RPM ceasing to fall** — a firmware clamp. Compared as RPM-per-duty-point
+  slope against the steepest slope seen so far, so the verdict does not change
+  with how finely you stepped the sweep.
+
+It deliberately does not resume below the first breakdown. The 2% and 0% rows
+above show why: their spread closes back to 19% and 15%, looking well behaved
+again purely because every fan is now sitting on the same floor. A rule judging
+each step on its own numbers would sail past the 4% breakdown and recommend 0%.
+
+Each step aborts the sweep if a selected sensor reaches `-max-temp` (default
+60°C), a GPU reaches `-max-gpu-temp` (default 75°C), or any fan falls below
+`-min-rpm` (default 900). BMC automatic control is restored on every exit path,
+including Ctrl-C.
+
+Sweep refuses to run while the daemon is active, since fanctl would overwrite
+the commanded duty within one poll and the numbers would be silently wrong.
+Detection is best-effort (`systemctl is-active`); pass `-force` where it is
+wrong, such as a remote BMC. `-steps`, `-settle`, and `-format`
+(`table`/`tsv`/`json`) are the other knobs — see `fanctl sweep -h`.
+
+On a host with `gpu.enabled`, sweep reads the GPU too: the table gains a GPU
+column, the abort checks cover it, and an unreadable GPU fails the sweep rather
+than continuing on CPU data alone — the same invariant the daemon holds, since
+a passively-cooled card is exactly what a lowered floor puts at risk.
+
+To keep that invariant true, sweep — unlike `doctor` and `probe` — *requires*
+the config it was pointed at and will not fall back to built-in defaults. The
+defaults clear `gpu.enabled`, so a mistyped `-config` would otherwise drop a
+passively-cooled GPU out of the safety envelope, silently and with exit 0,
+during the one operation that deliberately drives duty toward zero. A bad
+`-config` exits 2 before contacting the BMC.
+
+Two things to read off the output with care:
+
+- Settle time measures a **transient**. A chassis takes minutes to reach thermal
+  equilibrium, so idle temperature at the chosen floor will land above the
+  figure in the table — hold the duty for ~10 minutes before placing the anchor.
+- Without `gpu.enabled` it sees fans and the configured sensors only. A
+  **passively-cooled card** that depends on chassis airflow and exposes no
+  temperature of its own — an HBA, for instance — may require a higher floor
+  than the fans and CPUs imply.
+
+On a GPU host, lower the bottom anchor of **both** `curve` and `gpu.curve`. The
+daemon commands the higher of the two and each is flat below its own first
+anchor, so a `gpu.curve` still starting at `55 → 20` pins idle at 20% however
+low the main curve's floor goes.
 
 ## Configuration
 

@@ -294,3 +294,55 @@ func TestDesiredIntervalAdaptive(t *testing.T) {
 		t.Fatalf("hot interval = %s, want hot %s", d, tun.pollHot)
 	}
 }
+
+// The deadband must delay a small decrease, not cancel one forever, and while
+// it is delaying it must not write to the BMC. Both halves matter: holding
+// forever stranded a tuned floor a point above where the curve asked for it,
+// and treating the hold bookkeeping as a state change would re-issue the raw
+// commands on every poll of exactly the wobble the deadband absorbs.
+func TestControllerSettlesOntoCurveFloorWithoutChurn(t *testing.T) {
+	rr := &recordingRunner{temps: "Temp | 0Eh | ok | 3.1 | 48 degrees C"}
+	c := newTestController(rr)
+
+	tun := testTunables()
+	tun.curve = fan.Curve{Bands: []fan.Band{
+		{MaxTemp: 48, Percent: 6},
+		{MaxTemp: 54, Percent: 12},
+		{MaxTemp: 60, Percent: 18},
+	}, Hysteresis: 5}
+	tun.gpuCurve = tun.curve
+	tun.gov = fan.Governor{Deadband: 3, MaxStepDown: 10, DeadbandHoldPolls: 3}
+	c.setTunables(tun)
+	// Arrive at 7%: one point above the floor, which the deadband alone can
+	// never close because the curve is flat below its lowest anchor.
+	c.state = fan.State{Pct: 7, Init: true}
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	polls := 0
+	c.now = func() time.Time {
+		polls++
+		return base.Add(time.Duration(polls) * 30 * time.Second)
+	}
+
+	for i := 1; i < tun.gov.DeadbandHoldPolls; i++ {
+		if err := c.step(context.Background()); err != nil {
+			t.Fatalf("poll %d: %v", i, err)
+		}
+		if c.state.Pct != 7 {
+			t.Fatalf("poll %d: duty = %d, want the decrease still held at 7", i, c.state.Pct)
+		}
+		if rr.raws != 0 {
+			t.Fatalf("poll %d: %d raw commands issued; a held decrease must not touch the BMC", i, rr.raws)
+		}
+	}
+
+	if err := c.step(context.Background()); err != nil {
+		t.Fatalf("final poll: %v", err)
+	}
+	if c.state.Pct != 6 {
+		t.Fatalf("duty = %d after %d polls, want the 6%% floor", c.state.Pct, tun.gov.DeadbandHoldPolls)
+	}
+	if rr.raws == 0 {
+		t.Fatal("reaching the floor must actually be commanded to the BMC")
+	}
+}

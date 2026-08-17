@@ -84,6 +84,18 @@ type State struct {
 	Pct  int  // commanded duty percent; meaningless when Auto
 	Auto bool // control handed to the BMC's automatic mode
 	Init bool // false until the first decision seeds the state
+	// Hold counts consecutive decisions a sub-deadband decrease has been held.
+	// It is bookkeeping, not commanded output: callers deciding whether to
+	// write to the BMC must compare with SameCommand, not ==, or every held
+	// poll looks like a change and produces the very churn the deadband exists
+	// to prevent.
+	Hold int
+}
+
+// SameCommand reports whether two states would command the same thing of the
+// BMC, ignoring bookkeeping like Hold.
+func (s State) SameCommand(o State) bool {
+	return s.Pct == o.Pct && s.Auto == o.Auto && s.Init == o.Init
 }
 
 // Governor turns a duty target into the next commanded state. It is pure: all
@@ -96,6 +108,20 @@ type Governor struct {
 	// MaxStepDown caps the percent-point decrease per decision so the fans
 	// spin down smoothly after a load drops. 0 means uncapped.
 	MaxStepDown int
+	// DeadbandHoldPolls is how many consecutive decisions a sub-deadband
+	// decrease is held before it is applied anyway.
+	//
+	// Without it the deadband does not delay a small decrease, it cancels one
+	// forever. Below the curve's lowest anchor the curve is flat, so the target
+	// is pinned at the floor and the gap to a duty sitting 1-2 points above it
+	// can never grow to Deadband. A host that arrives at 7% with a 6% floor
+	// stays at 7% indefinitely, never reaching the duty its curve was tuned
+	// for. Holding for a few polls keeps the anti-hunting property — a target
+	// genuinely oscillating across a band boundary resets the count and still
+	// holds — while letting a settled temperature converge.
+	//
+	// 0 restores the old cancel-forever behaviour.
+	DeadbandHoldPolls int
 }
 
 // Next computes the next state. target/wantAuto come from Curve.Duty (after
@@ -117,10 +143,22 @@ func (g Governor) Next(s State, target float64, wantAuto, canReclaim bool) State
 		return State{Auto: true, Init: true}
 	}
 	if pct > s.Pct {
+		// Upward moves are never gated: responsiveness upward is safety.
 		return State{Pct: pct, Auto: false, Init: true}
 	}
-	if s.Pct-pct < g.Deadband {
+	if pct == s.Pct {
+		// The decrease went away; nothing is being held any more.
+		s.Hold = 0
 		return s
+	}
+	if s.Pct-pct < g.Deadband {
+		// Hold the small decrease, but count it. Once it has persisted across
+		// DeadbandHoldPolls decisions it is a settled target, not wobble, and
+		// falls through to be applied.
+		if hold := s.Hold + 1; g.DeadbandHoldPolls <= 0 || hold < g.DeadbandHoldPolls {
+			s.Hold = hold
+			return s
+		}
 	}
 	if g.MaxStepDown > 0 && s.Pct-pct > g.MaxStepDown {
 		pct = s.Pct - g.MaxStepDown

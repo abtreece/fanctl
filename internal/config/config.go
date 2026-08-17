@@ -144,12 +144,18 @@ func (c *Config) GPUFanCurve() fan.Curve {
 
 // Governor assembles the fan.Governor from the config.
 func (c *Config) Governor() fan.Governor {
-	return fan.Governor{Deadband: c.Deadband, MaxStepDown: maxStepDown}
+	return fan.Governor{Deadband: c.Deadband, MaxStepDown: maxStepDown, DeadbandHoldPolls: deadbandHoldPolls}
 }
 
 // maxStepDown caps how many percent-points the duty may fall per poll so fans
 // wind down smoothly after load drops; not currently configurable.
 const maxStepDown = 10
+
+// deadbandHoldPolls is how many consecutive polls a sub-deadband decrease is
+// held before being applied anyway, so the duty can settle onto the curve's
+// floor instead of being stranded a point or two above it forever; not
+// currently configurable.
+const deadbandHoldPolls = 3
 
 // EffectiveStepTimeout is the deadline applied to one control iteration. It is
 // capped at the shortest poll cadence in play — the hot one when adaptive

@@ -474,7 +474,11 @@ func (c *controller) step(ctx context.Context) error {
 			"commanded_delta_pct", failedDelta, "rpm", fanRPM)
 	}
 
-	changed := next != prev
+	// Compare what would be commanded, not the whole struct: the governor also
+	// carries hold bookkeeping that changes while a sub-deadband decrease is
+	// being held, and treating that as a change would write to the BMC on every
+	// poll of exactly the wobble the deadband exists to absorb.
+	changed := !next.SameCommand(prev)
 	if changed || reassertDue || verifyFailed {
 		if reassertDue && !changed && !verifyFailed {
 			c.log.Debug("re-asserting manual fan control", "percent", next.Pct)

@@ -32,6 +32,7 @@ cmd/fanctl/main.go        — kong root (daemon) + os.Args dispatch to doctor/pr
 cmd/fanctl/run.go         — daemon: control loop + controller (change-detection, fallback-to-auto)
 cmd/fanctl/doctor.go      — preflight checks; ok/warn/FAIL report, DI via doctorDeps
 cmd/fanctl/probe.go       — controllability sweep: command low duty, measure RPM drop
+cmd/fanctl/sweep.go       — duty sweep: step duty down, measure RPM/temp, `-suggest` a floor
 cmd/fanctl/install.go     — //go:embed systemd unit + example config; write + enable
 cmd/fanctl/restore.go     — `restore-auto` subcommand; what the unit's ExecStopPost runs
 cmd/fanctl/watchdog.go    — sd_notify (no dep) + loop-liveness watchdog pings
@@ -67,12 +68,51 @@ packaging/                — nfpm postinstall/preremove (preremove restores BMC
   downward moves step one band at a time, gated by hysteresis below the lower
   band's ceiling; leaving BMC-auto also requires the hysteresis margin. All in
   `internal/fan`, fully unit-tested.
+- **The deadband delays a decrease, it does not cancel one.** Comparing the new
+  target against the *current duty* strands the duty above the curve's floor:
+  below the lowest anchor the curve is flat, so the target is pinned at the
+  floor and the gap can never grow to `deadband`. A host arriving at 7% with a
+  6% floor stayed at 7% forever, giving back much of the noise the floor was
+  tuned for. `Governor.DeadbandHoldPolls` (3, alongside `maxStepDown` in
+  `config.go`) applies a sub-deadband decrease once it has persisted that many
+  decisions; a target genuinely oscillating across a band boundary resets the
+  count and is still absorbed. The count lives in `fan.State.Hold`, which is
+  bookkeeping — `run.go` must compare with `State.SameCommand`, not `==`, or
+  every held poll re-issues the raw commands and recreates the churn.
 - **Fallback to BMC auto** is the safe state: on over-temp (above top band),
   unreadable sensors, control-step error, and daemon shutdown (defer + unit
   `ExecStopPost`).
 - **probe** exists because Dell's forced baseline often sits ~30% duty (so
   commanding 30% looks like a no-op) and some iDRAC firmware ignores the raw
   commands. Probe commands a LOW duty and measures the RPM drop.
+- **sweep** is probe generalised across a range, for choosing the curve's bottom
+  anchor — below it the curve is flat, so that anchor's percent *is* the idle
+  duty. `-suggest` walks steps from most to least airflow and stops at the first
+  breakdown (fan spread blowing out, or RPM no longer falling); it must not
+  resume below that point, because once fans bottom out the lower steps look
+  well behaved again on their own numbers. Two limits are stated in its output
+  rather than hidden: settle time measures a transient (equilibrium runs
+  several °C higher), and without `gpu.enabled` it cannot see passively-cooled
+  cards with no temperature sensor of their own. With `gpu.enabled` it reads the
+  GPU as well, and an unreadable GPU aborts the sweep — same fail-safe invariant
+  as the daemon. To keep that invariant true, sweep (unlike doctor and probe)
+  *requires* the config it was pointed at: falling back to defaults would clear
+  `gpu.enabled` and leave a T4 unwatched during the one operation that
+  deliberately drives duty toward zero.
+- **Both `-suggest` breakdown tests are relative, not absolute.** Fan spread is
+  judged as a *rise* over the sweep's own reference spread (baseline, else the
+  top step), because the R430 idles with its fans 37% apart at every duty and an
+  absolute threshold called that host broken at the first step. The clamp test
+  compares RPM-per-duty-point slope against the steepest slope seen so far, not
+  a raw RPM drop against a percentage of the previous step, so the verdict does
+  not change with how finely the sweep was stepped. An absolute spread ceiling
+  and an absolute minimum slope still catch hosts that are already incoherent or
+  already clamped at the first step, where there is no healthy reference.
+- **Lowering the idle floor on a GPU host means lowering both curves.** The
+  daemon commands `max(cpuCurveDuty, gpuCurveDuty)` (`run.go`) and `Curve.Duty`
+  is flat below its first anchor, so a `gpu.curve` starting at `55 → 20` holds
+  idle at 20% no matter how low the main curve's floor goes. `sweep -suggest`
+  says so on GPU hosts.
 - **Sensor selection:** explicit SDR `ids` win; otherwise name include/exclude
   (default match "Temp", exclude "Inlet"/"Exhaust") picks CPU sensors across
   Dell generations.
