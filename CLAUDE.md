@@ -68,6 +68,17 @@ packaging/                — nfpm postinstall/preremove (preremove restores BMC
   downward moves step one band at a time, gated by hysteresis below the lower
   band's ceiling; leaving BMC-auto also requires the hysteresis margin. All in
   `internal/fan`, fully unit-tested.
+- **The deadband delays a decrease, it does not cancel one.** Comparing the new
+  target against the *current duty* strands the duty above the curve's floor:
+  below the lowest anchor the curve is flat, so the target is pinned at the
+  floor and the gap can never grow to `deadband`. A host arriving at 7% with a
+  6% floor stayed at 7% forever, giving back much of the noise the floor was
+  tuned for. `Governor.DeadbandHoldPolls` (3, alongside `maxStepDown` in
+  `config.go`) applies a sub-deadband decrease once it has persisted that many
+  decisions; a target genuinely oscillating across a band boundary resets the
+  count and is still absorbed. The count lives in `fan.State.Hold`, which is
+  bookkeeping — `run.go` must compare with `State.SameCommand`, not `==`, or
+  every held poll re-issues the raw commands and recreates the churn.
 - **Fallback to BMC auto** is the safe state: on over-temp (above top band),
   unreadable sensors, control-step error, and daemon shutdown (defer + unit
   `ExecStopPost`).
