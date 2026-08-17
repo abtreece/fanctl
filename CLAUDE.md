@@ -32,6 +32,7 @@ cmd/fanctl/main.go        — kong root (daemon) + os.Args dispatch to doctor/pr
 cmd/fanctl/run.go         — daemon: control loop + controller (change-detection, fallback-to-auto)
 cmd/fanctl/doctor.go      — preflight checks; ok/warn/FAIL report, DI via doctorDeps
 cmd/fanctl/probe.go       — controllability sweep: command low duty, measure RPM drop
+cmd/fanctl/sweep.go       — duty sweep: step duty down, measure RPM/temp, `-suggest` a floor
 cmd/fanctl/install.go     — //go:embed systemd unit + example config; write + enable
 cmd/fanctl/restore.go     — `restore-auto` subcommand; what the unit's ExecStopPost runs
 cmd/fanctl/watchdog.go    — sd_notify (no dep) + loop-liveness watchdog pings
@@ -73,6 +74,22 @@ packaging/                — nfpm postinstall/preremove (preremove restores BMC
 - **probe** exists because Dell's forced baseline often sits ~30% duty (so
   commanding 30% looks like a no-op) and some iDRAC firmware ignores the raw
   commands. Probe commands a LOW duty and measures the RPM drop.
+- **sweep** is probe generalised across a range, for choosing the curve's bottom
+  anchor — below it the curve is flat, so that anchor's percent *is* the idle
+  duty. `-suggest` walks steps from most to least airflow and stops at the first
+  breakdown (fan spread blowing out, or RPM no longer falling); it must not
+  resume below that point, because once fans bottom out the lower steps look
+  well behaved again on their own numbers. Two limits are stated in its output
+  rather than hidden: settle time measures a transient (equilibrium runs
+  several °C higher), and without `gpu.enabled` it cannot see passively-cooled
+  cards with no temperature sensor of their own. With `gpu.enabled` it reads the
+  GPU as well, and an unreadable GPU aborts the sweep — same fail-safe invariant
+  as the daemon.
+- **Lowering the idle floor on a GPU host means lowering both curves.** The
+  daemon commands `max(cpuCurveDuty, gpuCurveDuty)` (`run.go`) and `Curve.Duty`
+  is flat below its first anchor, so a `gpu.curve` starting at `55 → 20` holds
+  idle at 20% no matter how low the main curve's floor goes. `sweep -suggest`
+  says so on GPU hosts.
 - **Sensor selection:** explicit SDR `ids` win; otherwise name include/exclude
   (default match "Temp", exclude "Inlet"/"Exhaust") picks CPU sensors across
   Dell generations.

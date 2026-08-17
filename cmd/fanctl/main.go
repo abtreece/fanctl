@@ -19,7 +19,7 @@ var (
 	date    = "unknown"
 )
 
-// CLI is the root (daemon) command surface. The doctor/probe/install
+// CLI is the root (daemon) command surface. The doctor/probe/sweep/install
 // subcommands are dispatched from os.Args before kong parses, mirroring
 // runnerctl, so the daemon's flag surface stays clean.
 type CLI struct {
@@ -37,6 +37,8 @@ func main() {
 			os.Exit(runDoctor(os.Args[2:]))
 		case "probe":
 			os.Exit(runProbe(os.Args[2:]))
+		case "sweep":
+			os.Exit(runSweep(os.Args[2:]))
 		case "install":
 			os.Exit(runInstall(os.Args[2:]))
 		case "restore-auto":
@@ -50,7 +52,7 @@ func main() {
 	var cli CLI
 	ctx := kong.Parse(&cli,
 		kong.Name("fanctl"),
-		kong.Description("Temperature-based BMC fan controller for Dell PowerEdge (IPMI).\n\nSubcommands: doctor (preflight checks), probe (confirm manual fan control works), install (systemd unit + config), restore-auto (hand fans back to the BMC)."),
+		kong.Description("Temperature-based BMC fan controller for Dell PowerEdge (IPMI).\n\nSubcommands: doctor (preflight checks), probe (confirm manual fan control works), sweep (measure RPM and temperature against duty to pick a curve floor), install (systemd unit + config), restore-auto (hand fans back to the BMC)."),
 		kong.UsageOnError(),
 		kong.ConfigureHelp(kong.HelpOptions{Compact: true}),
 		kong.Vars{
