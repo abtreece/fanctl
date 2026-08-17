@@ -88,9 +88,13 @@ func TestGovernorRaisesImmediately(t *testing.T) {
 	if s := gov().Next(prev, 70, false, true); s.Pct != 70 {
 		t.Fatalf("raise 20->70 = %+v; want immediate 70", s)
 	}
-	// Even a 1-point raise is not deadband-gated.
-	if s := gov().Next(prev, 21, false, true); s.Pct != 21 {
-		t.Fatalf("raise 20->21 = %+v; want 21", s)
+	// A raise of a full deadband is still immediate.
+	if s := gov().Next(prev, 23, false, true); s.Pct != 23 {
+		t.Fatalf("raise 20->23 = %+v; want immediate 23", s)
+	}
+	// A sub-deadband raise is debounced, not applied on the first sight of it.
+	if s := gov().Next(prev, 21, false, true); s.Pct != 20 {
+		t.Fatalf("raise 20->21 = %+v; want it held pending confirmation", s)
 	}
 }
 
@@ -149,7 +153,37 @@ func TestGovernorHoldResetsWhenTargetOscillates(t *testing.T) {
 	}
 }
 
-func TestGovernorZeroHoldPollsHoldsForever(t *testing.T) {
+// The regression that debouncing only decreases produced, taken from razor's
+// journal: idle wobbling between 47°C and 48°C, where the predictor turns the
+// 48°C sample into a 7% target and 47°C reads as the 6% floor. With increases
+// ungated the duty cycled every couple of polls. It must settle instead.
+func TestGovernorAbsorbsJitterAroundTheFloor(t *testing.T) {
+	g := gov()
+	s := State{Pct: 7, Init: true}
+	// Runs of 47°C (target 6) settle onto the floor; each isolated 48°C sample
+	// (target 7, via the predictor) is the blip that used to bounce it back up
+	// immediately, costing another three polls to undo.
+	targets := []float64{6, 6, 6, 7, 6, 6, 6, 7, 6, 6, 6, 7}
+	changes := 0
+	last := s.Pct
+	for _, target := range targets {
+		s = g.Next(s, target, false, true)
+		if s.Pct != last {
+			changes++
+			last = s.Pct
+		}
+	}
+	// It should descend to the floor once and stay there. With increases
+	// ungated this cycled 6 -> 7 -> 6 for every blip.
+	if s.Pct != 6 {
+		t.Errorf("final pct = %d, want the 6%% floor", s.Pct)
+	}
+	if changes != 1 {
+		t.Errorf("duty changed %d times across %d polls of 1-point jitter; want exactly 1 (the descent)", changes, len(targets))
+	}
+}
+
+func TestGovernorZeroHoldPollsKeepsOldBehaviour(t *testing.T) {
 	g := Governor{Deadband: 3, MaxStepDown: 10} // DeadbandHoldPolls unset
 	s := State{Pct: 7, Init: true}
 	for i := 0; i < 20; i++ {
@@ -157,6 +191,10 @@ func TestGovernorZeroHoldPollsHoldsForever(t *testing.T) {
 	}
 	if s.Pct != 7 {
 		t.Fatalf("pct = %d; with DeadbandHoldPolls unset the decrease must never apply", s.Pct)
+	}
+	// ...and small increases stay immediate.
+	if s = g.Next(s, 8, false, true); s.Pct != 8 {
+		t.Fatalf("pct = %d; with DeadbandHoldPolls unset a small increase is immediate", s.Pct)
 	}
 }
 

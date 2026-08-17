@@ -151,10 +151,10 @@ func (c *Config) Governor() fan.Governor {
 // wind down smoothly after load drops; not currently configurable.
 const maxStepDown = 10
 
-// deadbandHoldPolls is how many consecutive polls a sub-deadband decrease is
-// held before being applied anyway, so the duty can settle onto the curve's
-// floor instead of being stranded a point or two above it forever; not
-// currently configurable.
+// deadbandHoldPolls is how many consecutive polls a sub-deadband move must
+// persist before being applied, in either direction, so the duty can settle
+// onto the curve's floor instead of being stranded above it while 1-point
+// jitter is still absorbed rather than cycled on; not currently configurable.
 const deadbandHoldPolls = 3
 
 // EffectiveStepTimeout is the deadline applied to one control iteration. It is
