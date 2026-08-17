@@ -68,17 +68,23 @@ packaging/                — nfpm postinstall/preremove (preremove restores BMC
   downward moves step one band at a time, gated by hysteresis below the lower
   band's ceiling; leaving BMC-auto also requires the hysteresis margin. All in
   `internal/fan`, fully unit-tested.
-- **The deadband delays a decrease, it does not cancel one.** Comparing the new
-  target against the *current duty* strands the duty above the curve's floor:
-  below the lowest anchor the curve is flat, so the target is pinned at the
-  floor and the gap can never grow to `deadband`. A host arriving at 7% with a
-  6% floor stayed at 7% forever, giving back much of the noise the floor was
-  tuned for. `Governor.DeadbandHoldPolls` (3, alongside `maxStepDown` in
-  `config.go`) applies a sub-deadband decrease once it has persisted that many
-  decisions; a target genuinely oscillating across a band boundary resets the
-  count and is still absorbed. The count lives in `fan.State.Hold`, which is
-  bookkeeping — `run.go` must compare with `State.SameCommand`, not `==`, or
-  every held poll re-issues the raw commands and recreates the churn.
+- **The deadband debounces sub-deadband moves in BOTH directions.** Gating only
+  decreases does not delay a small one, it cancels it forever: below the lowest
+  anchor the curve is flat, so the target is pinned at the floor and the gap can
+  never grow to `deadband`. A host arriving at 7% above a 6% floor stayed there
+  indefinitely, giving back much of the noise the floor was tuned for. But
+  debouncing decreases while leaving small increases immediate merely ratchets —
+  measured on razor, a 1°C idle blip amplified by the predictor raised the
+  target a point and applied at once, undoing a descent that took three polls to
+  earn, cycling every ~75s, which is worse churn than the deadband was
+  introduced to prevent. `Governor.DeadbandHoldPolls` (3, alongside
+  `maxStepDown` in `config.go`) applies a sub-deadband move only once the same
+  target has persisted that many decisions, whichever way it points; a move of
+  `deadband` or more stays immediate, so real ramps are unaffected and the
+  predictor's lookahead already pushes those past the threshold. The count lives
+  in `fan.State.Hold`/`HoldPct`, which is bookkeeping — `run.go` must compare
+  with `State.SameCommand`, not `==`, or every held poll re-issues the raw
+  commands and recreates the churn.
 - **Fallback to BMC auto** is the safe state: on over-temp (above top band),
   unreadable sensors, control-step error, and daemon shutdown (defer + unit
   `ExecStopPost`).

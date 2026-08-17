@@ -84,12 +84,13 @@ type State struct {
 	Pct  int  // commanded duty percent; meaningless when Auto
 	Auto bool // control handed to the BMC's automatic mode
 	Init bool // false until the first decision seeds the state
-	// Hold counts consecutive decisions a sub-deadband decrease has been held.
-	// It is bookkeeping, not commanded output: callers deciding whether to
-	// write to the BMC must compare with SameCommand, not ==, or every held
-	// poll looks like a change and produces the very churn the deadband exists
-	// to prevent.
-	Hold int
+	// Hold counts consecutive decisions HoldPct has been the target while a
+	// sub-deadband move is being debounced; HoldPct is that target. Both are
+	// bookkeeping, not commanded output: callers deciding whether to write to
+	// the BMC must compare with SameCommand, not ==, or every held poll looks
+	// like a change and produces the very churn the deadband exists to prevent.
+	Hold    int
+	HoldPct int
 }
 
 // SameCommand reports whether two states would command the same thing of the
@@ -108,19 +109,27 @@ type Governor struct {
 	// MaxStepDown caps the percent-point decrease per decision so the fans
 	// spin down smoothly after a load drops. 0 means uncapped.
 	MaxStepDown int
-	// DeadbandHoldPolls is how many consecutive decisions a sub-deadband
-	// decrease is held before it is applied anyway.
+	// DeadbandHoldPolls is how many consecutive decisions a sub-deadband move
+	// must persist before it is applied. It debounces in BOTH directions.
 	//
-	// Without it the deadband does not delay a small decrease, it cancels one
-	// forever. Below the curve's lowest anchor the curve is flat, so the target
-	// is pinned at the floor and the gap to a duty sitting 1-2 points above it
-	// can never grow to Deadband. A host that arrives at 7% with a 6% floor
-	// stays at 7% indefinitely, never reaching the duty its curve was tuned
-	// for. Holding for a few polls keeps the anti-hunting property — a target
-	// genuinely oscillating across a band boundary resets the count and still
-	// holds — while letting a settled temperature converge.
+	// Gating only decreases does not delay a small one, it cancels it forever:
+	// below the curve's lowest anchor the curve is flat, so the target is
+	// pinned at the floor and the gap to a duty sitting 1-2 points above can
+	// never grow to Deadband. A host arriving at 7% above a 6% floor stays at
+	// 7% indefinitely, never reaching the duty its curve was tuned for.
 	//
-	// 0 restores the old cancel-forever behaviour.
+	// But debouncing decreases while leaving small increases immediate just
+	// ratchets: measured on an R420, a 1°C idle blip amplified by the predictor
+	// raised the target one point and was applied at once, undoing a descent
+	// that had taken three polls to earn, and the duty cycled every ~75s —
+	// worse churn than the deadband was introduced to prevent. Sub-deadband
+	// jitter has to be absorbed whichever way it points.
+	//
+	// A move of Deadband or more is still immediate in both directions, so
+	// responsiveness to a real ramp is unchanged; only 1-2 point wobble waits,
+	// and the predictor's lookahead already biases genuine ramps past the
+	// threshold. 0 restores the old behaviour (increases immediate, small
+	// decreases cancelled forever).
 	DeadbandHoldPolls int
 }
 
@@ -142,26 +151,39 @@ func (g Governor) Next(s State, target float64, wantAuto, canReclaim bool) State
 	if wantAuto {
 		return State{Auto: true, Init: true}
 	}
-	if pct > s.Pct {
-		// Upward moves are never gated: responsiveness upward is safety.
-		return State{Pct: pct, Auto: false, Init: true}
-	}
 	if pct == s.Pct {
-		// The decrease went away; nothing is being held any more.
-		s.Hold = 0
+		// Nothing pending any more.
+		s.Hold, s.HoldPct = 0, 0
 		return s
 	}
-	if s.Pct-pct < g.Deadband {
-		// Hold the small decrease, but count it. Once it has persisted across
-		// DeadbandHoldPolls decisions it is a settled target, not wobble, and
-		// falls through to be applied.
-		if hold := s.Hold + 1; g.DeadbandHoldPolls <= 0 || hold < g.DeadbandHoldPolls {
-			s.Hold = hold
-			return s
+
+	delta := pct - s.Pct
+	if delta >= g.Deadband || -delta >= g.Deadband {
+		// A move worth making: immediate upward, rate-limited downward.
+		if g.MaxStepDown > 0 && -delta > g.MaxStepDown {
+			pct = s.Pct - g.MaxStepDown
 		}
+		return State{Pct: pct, Auto: false, Init: true}
 	}
-	if g.MaxStepDown > 0 && s.Pct-pct > g.MaxStepDown {
-		pct = s.Pct - g.MaxStepDown
+
+	// Sub-deadband wobble from here down.
+	if g.DeadbandHoldPolls <= 0 {
+		if delta > 0 {
+			return State{Pct: pct, Auto: false, Init: true}
+		}
+		return s
+	}
+
+	// Count consecutive decisions asking for this same target. A target that
+	// keeps changing never accumulates, so genuine jitter is still absorbed;
+	// one that persists is a settled reading and gets applied.
+	hold := 1
+	if s.Hold > 0 && s.HoldPct == pct {
+		hold = s.Hold + 1
+	}
+	if hold < g.DeadbandHoldPolls {
+		s.Hold, s.HoldPct = hold, pct
+		return s
 	}
 	return State{Pct: pct, Auto: false, Init: true}
 }
