@@ -69,12 +69,34 @@ func New(opt Options, run Runner) *Client {
 	return &Client{bin: bin, connArgs: conn, run: run}
 }
 
-// exec runs ipmitool with the connection arguments prepended.
+// exec runs ipmitool with the connection arguments prepended. On failure the
+// error carries ipmitool's own output: an exit status alone cannot tell a
+// firmware that rejects the raw fan commands from a privilege or session
+// problem, but ipmitool's message (with its completion code, e.g. rsp=0xd4)
+// can.
 func (c *Client) exec(ctx context.Context, args ...string) ([]byte, error) {
 	full := make([]string, 0, len(c.connArgs)+len(args))
 	full = append(full, c.connArgs...)
 	full = append(full, args...)
-	return c.run(ctx, c.bin, full...)
+	out, err := c.run(ctx, c.bin, full...)
+	if err != nil {
+		if msg := oneLine(out); msg != "" {
+			return out, fmt.Errorf("%w: %s", err, msg)
+		}
+	}
+	return out, err
+}
+
+// oneLine collapses command output into a single log-friendly line, joining
+// non-blank lines with "; ".
+func oneLine(out []byte) string {
+	var lines []string
+	for _, ln := range strings.Split(string(out), "\n") {
+		if ln = strings.TrimSpace(ln); ln != "" {
+			lines = append(lines, ln)
+		}
+	}
+	return strings.Join(lines, "; ")
 }
 
 // Temp is a parsed temperature SDR record.
