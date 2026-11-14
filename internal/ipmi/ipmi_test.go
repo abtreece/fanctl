@@ -2,6 +2,7 @@ package ipmi
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -16,10 +17,9 @@ type fakeRunner struct {
 
 func (f *fakeRunner) run(_ context.Context, name string, args ...string) ([]byte, error) {
 	f.calls = append(f.calls, append([]string{name}, args...))
-	if f.err != nil {
-		return nil, f.err
-	}
-	return []byte(f.responses[strings.Join(args, " ")]), nil
+	// Like exec's CombinedOutput, a failing command still returns whatever it
+	// printed: that output is the diagnosis.
+	return []byte(f.responses[strings.Join(args, " ")]), f.err
 }
 
 const sampleTemps = `Inlet Temp       | 04h | ok  |  7.1 | 22 degrees C
@@ -128,5 +128,57 @@ func TestSDRErrorWraps(t *testing.T) {
 	c := New(Options{Bin: "ipmitool"}, f.run)
 	if _, err := c.Temperatures(context.Background()); err == nil {
 		t.Error("expected error from failing runner")
+	}
+}
+
+// An exit status alone cannot distinguish a firmware lockout from a privilege
+// or connection problem; ipmitool's own message, with its completion code, can.
+func TestFailureIncludesIpmitoolOutput(t *testing.T) {
+	exitErr := errors.New("exit status 1")
+	f := &fakeRunner{
+		err: exitErr,
+		responses: map[string]string{
+			"raw 0x30 0x30 0x01 0x00": "Unable to send RAW command (channel=0x0 netfn=0x30 lun=0x0 cmd=0x30 rsp=0xd4): Insufficient privilege level\n",
+		},
+	}
+	c := New(Options{Bin: "ipmitool"}, f.run)
+
+	err := c.SetManual(context.Background())
+	if err == nil {
+		t.Fatal("expected error from failing runner")
+	}
+	want := "ipmitool raw 0x30 0x30 0x01 0x00: exit status 1: Unable to send RAW command (channel=0x0 netfn=0x30 lun=0x0 cmd=0x30 rsp=0xd4): Insufficient privilege level"
+	if err.Error() != want {
+		t.Errorf("error = %q\nwant    %q", err, want)
+	}
+	if !errors.Is(err, exitErr) {
+		t.Error("error no longer wraps the runner's error")
+	}
+}
+
+func TestFailureOutputIsSingleLine(t *testing.T) {
+	f := &fakeRunner{
+		err: errors.New("exit status 1"),
+		responses: map[string]string{
+			"sdr type fan": "Error: Unable to establish IPMI v2 / RMCP+ session\n\nUnable to open SDR for reading\n",
+		},
+	}
+	c := New(Options{Bin: "ipmitool"}, f.run)
+
+	_, err := c.Fans(context.Background())
+	want := "ipmitool sdr type fan: exit status 1: Error: Unable to establish IPMI v2 / RMCP+ session; Unable to open SDR for reading"
+	if err == nil || err.Error() != want {
+		t.Errorf("error = %v\nwant    %q", err, want)
+	}
+}
+
+func TestFailureWithoutOutputIsUnchanged(t *testing.T) {
+	f := &fakeRunner{err: errors.New("exit status 1")}
+	c := New(Options{Bin: "ipmitool"}, f.run)
+
+	err := c.SetAuto(context.Background())
+	want := "ipmitool raw 0x30 0x30 0x01 0x01: exit status 1"
+	if err == nil || err.Error() != want {
+		t.Errorf("error = %v, want %q", err, want)
 	}
 }
