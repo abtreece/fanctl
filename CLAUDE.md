@@ -156,7 +156,9 @@ hence config-driven sensor selection and curve rather than hardcoded values.
 - [x] Optional out-of-band IPMI (lanplus) for remote BMCs — `connection:` config,
   `ipmi.Options`/`ipmi.New` prepends `-I/-H/-U/-P`.
 - [x] Config file watch / SIGHUP reload — `watch.go` (fsnotify on config dir) +
-  reload closure in `runDaemon`; reloads curve/sensors/hysteresis/poll interval,
+  reload closure in `runDaemon`; reloads curve/sensors/hysteresis/poll interval
+  and GPU monitoring (the `gpu.Reader` lives in `tunables`, so `gpu.enabled` /
+  `gpu.command` apply live),
   warns that connection/ipmitool changes need a restart.
 - [x] Prometheus metrics endpoint — `metrics.go` hand-renders the text
   exposition (no client dep); optional `metrics.listen`. Controller keeps a
