@@ -50,11 +50,7 @@ func newIPMIClient(cfg *config.Config) *ipmi.Client {
 // it performs a single iteration and exits.
 func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 	client := newIPMIClient(cfg)
-	var gpuReader *gpu.Reader
-	if cfg.GPU.Enabled {
-		gpuReader = gpu.New(cfg.GPU.Command, gpu.ExecRunner)
-	}
-	ctrl := &controller{log: log, client: client, gpu: gpuReader, dryRun: dryRun, now: time.Now}
+	ctrl := &controller{log: log, client: client, dryRun: dryRun, now: time.Now}
 	ctrl.setTunables(tunablesFrom(cfg))
 
 	// Every BMC round-trip is bounded: a wedged ipmitool must never stall the
@@ -80,6 +76,7 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 		"deadband", cfg.Deadband,
 		"lookahead_min", cfg.Lookahead,
 		"bands", len(cfg.Curve),
+		"gpu", cfg.GPU.Enabled,
 		"gpu_bands", len(cfg.GPU.Curve),
 		"connection", connDesc(cfg),
 		"dry_run", dryRun,
@@ -108,6 +105,15 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 		if fresh.IPMITool != cfg.IPMITool || fresh.Connection != cfg.Connection || fresh.StepTimeout != cfg.StepTimeout {
 			log.Warn("reload: connection/ipmitool/step_timeout changes require a restart and were not applied")
 		}
+		// GPU monitoring is rebuilt with the rest of the tunables. Say so when
+		// it flips: it changes which conditions fail safe to BMC auto.
+		if fresh.GPU.Enabled != cfg.GPU.Enabled {
+			if fresh.GPU.Enabled {
+				log.Info("reload: gpu monitoring enabled", "command", fresh.GPU.Command)
+			} else {
+				log.Info("reload: gpu monitoring disabled")
+			}
+		}
 		ctrl.setTunables(tunablesFrom(fresh))
 		ctrl.recordReload()
 		// Keep the connection/ipmitool the client was built with, and the
@@ -128,6 +134,7 @@ func runDaemon(log *slog.Logger, cfg *config.Config, dryRun, once bool) error {
 			"deadband", fresh.Deadband,
 			"lookahead_min", fresh.Lookahead,
 			"bands", len(fresh.Curve),
+			"gpu", fresh.GPU.Enabled,
 			"gpu_bands", len(fresh.GPU.Curve),
 		)
 	}
@@ -235,12 +242,23 @@ type tunables struct {
 	// reassert re-issues manual control this long after the last IPMI write
 	// even when the duty is unchanged. 0 disables.
 	reassert time.Duration
+	// gpu reads GPU temperatures; nil when GPU monitoring is disabled. It
+	// lives here rather than on the controller so a reload that flips
+	// gpu.enabled or changes gpu.command takes effect: a reader bound at
+	// startup kept polling a removed card (failing safe to BMC auto forever)
+	// or, worse, left a newly enabled card unwatched until restart.
+	gpu *gpu.Reader
 }
 
 func tunablesFrom(cfg *config.Config) tunables {
+	var gpuReader *gpu.Reader
+	if cfg.GPU.Enabled {
+		gpuReader = gpu.New(cfg.GPU.Command, gpu.ExecRunner)
+	}
 	return tunables{
 		curve:     cfg.FanCurve(),
 		gpuCurve:  cfg.GPUFanCurve(),
+		gpu:       gpuReader,
 		gov:       cfg.Governor(),
 		sensors:   cfg.Sensors,
 		lookahead: cfg.Lookahead,
@@ -277,7 +295,6 @@ func (c *controller) runStep(ctx context.Context, timeout time.Duration) {
 type controller struct {
 	log    *slog.Logger
 	client *ipmi.Client
-	gpu    *gpu.Reader // nil when GPU monitoring is disabled
 	dryRun bool
 	now    func() time.Time
 
@@ -382,8 +399,8 @@ func (c *controller) step(ctx context.Context) error {
 	// fails, fail safe to BMC automatic control — never cool a GPU host on CPU
 	// data alone, since a passively-cooled GPU depends on chassis airflow.
 	gpuC, gpuOK, gpuFail := 0, false, false
-	if c.gpu != nil {
-		if gtemps, gerr := c.gpu.Temperatures(ctx); gerr != nil {
+	if tun.gpu != nil {
+		if gtemps, gerr := tun.gpu.Temperatures(ctx); gerr != nil {
 			gpuFail = true
 			c.log.Warn("gpu temperature unreadable; handing to BMC automatic control", "err", gerr)
 		} else {
